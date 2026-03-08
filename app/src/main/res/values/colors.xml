@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="forge_bg">#0F0F1A</color>
+    <color name="forge_surface">#161625</color>
+    <color name="forge_card">#1E1E35</color>
+    <color name="forge_purple">#6C63FF</color>
+    <color name="forge_green">#22C55E</color>
+    <color name="forge_red">#F44336</color>
+    <color name="forge_text_primary">#FFFFFF</color>
+    <color name="forge_text_secondary">#7B7B9A</color>
+    <color name="colorPrimary">#6C63FF</color>
+    <color name="colorPrimaryDark">#5A52E8</color>
+    <color name="colorAccent">#22C55E</color>
+    <color name="white">#FFFFFF</color>
+    <color name="black">#000000</color>
+    <color name="ic_launcher_background">#6C63FF</color>
+</resources>

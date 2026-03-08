@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Forge</string>
+    <string name="new_project">New Project</string>
+    <string name="run">▶ Run</string>
+    <string name="send">Send</string>
+    <string name="building">Building...</string>
+    <string name="installed">Installed ✓</string>
+    <string name="hint_message">Describe what you want to build...</string>
+    <string name="hint_project_name">Project Name</string>
+    <string name="hint_domain">Domain (e.g. com.example)</string>
+    <string name="hint_app_name">App Name (lowercase)</string>
+</resources>
