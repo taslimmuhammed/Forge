@@ -45,6 +45,7 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
             excludes += "META-INF/DEPENDENCIES"
+            excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
         }
     }
 
@@ -134,6 +135,12 @@ dependencies {
     // Using 3.12.3: oldest version on Maven Central, supports Java 8, no javax.lang.model dependency
     // (Newer ECJ versions reference javax.lang.model.SourceVersion which doesn't exist on Android)
     implementation("org.eclipse.jdt:ecj:3.12.3")
+
+    // R8/D8 — for on-device .class → .dex conversion (replaces system dx which doesn't exist on stock Android)
+    implementation("com.android.tools:r8:8.3.37")
+
+    // BouncyCastle — for proper PKCS#7 APK v1 signing (raw signature bytes are rejected by modern Android)
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 
     // javax stubs — must be `implementation` (not compileOnly) so they're packaged into the APK
     // These classes exist in the JDK on the Mac but NOT on Android's runtime

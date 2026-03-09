@@ -18,13 +18,27 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.withContext
 import java.io.*
+import java.math.BigInteger
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.file.Path
 import java.security.KeyPairGenerator
 import java.security.KeyStore
+import java.security.SecureRandom
+import java.util.Date
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+
+import org.bouncycastle.asn1.x500.X500Name
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+import org.bouncycastle.cms.CMSProcessableByteArray
+import org.bouncycastle.cms.CMSSignedDataGenerator
+import org.bouncycastle.cms.jcajce.JcaSignerInfoGeneratorBuilder
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder
 
 class BuildEngine(
     private val context: Context,
@@ -80,9 +94,27 @@ class BuildEngine(
             val deps = resolveDependencies()
             deps.forEach { send(BuildEvent.Log("  ↳ ${it.coordinate}")) }
 
+            // ── Step 3.5: Generate R.java ──────────────────────────────
+            send(BuildEvent.Log("📝 Generating R.java..."))
+            val genDir = File(env.buildDir, "gen").also { it.mkdirs() }
+            try {
+                val resDir = File(env.srcDir, "res")
+                val manifestFile = File(env.srcDir, "AndroidManifest.xml")
+                if (resDir.exists() && manifestFile.exists()) {
+                    val resourceCompiler = ResourceCompiler()
+                    // Quick scan resources to generate R.java (no full compile yet)
+                    val resourceIds = scanResourceIds(resDir, packageName)
+                    resourceCompiler.generateRJava(resourceIds, packageName, genDir)
+                    send(BuildEvent.Log("  ✓ R.java generated"))
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "R.java generation failed (non-fatal): ${e.message}")
+                send(BuildEvent.Log("  ⚠ R.java generation skipped: ${e.message}"))
+            }
+
             // ── Step 4: compile ────────────────────────────────────────
             send(BuildEvent.Log("☕ Compiling Java sources..."))
-            val compileResult = compileWithEcj(env, deps)
+            val compileResult = compileWithEcj(env, deps, genDir)
             if (!compileResult.success) {
                 send(BuildEvent.Error(compileResult.errorLog))
                 return
@@ -223,14 +255,101 @@ class BuildEngine(
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // STEP 3.5 — Generate R.java resource IDs
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Quick-scan resource directories and values files to build resource ID map.
+     * Used for generating R.java before compilation.
+     */
+    private fun scanResourceIds(resDir: File, packageName: String): Map<String, Map<String, Int>> {
+        val result = mutableMapOf<String, MutableMap<String, Int>>()
+        val typeCounts = mutableMapOf<String, Int>()
+        val appPackageId = 0x7F
+
+        fun addResource(type: String, name: String, typeId: Int) {
+            val map = result.getOrPut(type) { mutableMapOf() }
+            if (name in map) return // already added
+            val entryId = typeCounts.getOrDefault(type, 0)
+            typeCounts[type] = entryId + 1
+            map[name] = (appPackageId shl 24) or (typeId shl 16) or entryId
+        }
+
+        // Values files (strings.xml, colors.xml, etc.)
+        val valuesDir = File(resDir, "values")
+        if (valuesDir.exists()) {
+            valuesDir.listFiles()?.filter { it.extension == "xml" }?.forEach { file ->
+                try {
+                    val factory = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+                    val doc = factory.newDocumentBuilder().parse(file)
+                    val children = doc.documentElement.childNodes
+                    for (i in 0 until children.length) {
+                        val node = children.item(i)
+                        if (node.nodeType != org.w3c.dom.Node.ELEMENT_NODE) continue
+                        val elem = node as org.w3c.dom.Element
+                        val name = elem.getAttribute("name") ?: continue
+                        when (elem.tagName) {
+                            "string" -> addResource("string", name, 0x06)
+                            "color" -> addResource("color", name, 0x07)
+                            "dimen" -> addResource("dimen", name, 0x08)
+                            "style" -> addResource("style", name, 0x09)
+                            "bool" -> addResource("bool", name, 0x0B)
+                            "integer" -> addResource("integer", name, 0x0C)
+                            "item" -> {
+                                if (elem.getAttribute("type") == "id") addResource("id", name, 0x0A)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to scan ${file.name}: ${e.message}")
+                }
+            }
+        }
+
+        // File-based resources
+        val fileDirs = mapOf(
+            "layout" to 0x04, "drawable" to 0x02, "mipmap" to 0x03,
+            "menu" to 0x0F, "xml" to 0x0E, "anim" to 0x05
+        )
+        fileDirs.forEach { (dirPrefix, typeId) ->
+            resDir.listFiles()?.filter { it.isDirectory && it.name.startsWith(dirPrefix) }?.forEach { dir ->
+                dir.listFiles()?.forEach { file ->
+                    addResource(dirPrefix.substringBefore('-'), file.nameWithoutExtension, typeId)
+                }
+            }
+        }
+
+        // IDs from @+id/ in layout XML files
+        val layoutDir = File(resDir, "layout")
+        if (layoutDir.exists()) {
+            layoutDir.listFiles()?.filter { it.extension == "xml" }?.forEach { file ->
+                try {
+                    Regex("@\\+id/(\\w+)").findAll(file.readText()).forEach { match ->
+                        addResource("id", match.groupValues[1], 0x0A)
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
+        return result
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // STEP 4 — Compile Java → .class via ECJ
     // ─────────────────────────────────────────────────────────────────
 
-    private fun compileWithEcj(env: BuildEnvironment, deps: List<DependencySpec>): BuildResult {
-        val javaFiles = env.srcDir.walkTopDown()
+    private fun compileWithEcj(env: BuildEnvironment, deps: List<DependencySpec>, genDir: File? = null): BuildResult {
+        val javaFiles = mutableListOf<String>()
+        
+        // Source files from src/main/java
+        env.srcDir.walkTopDown()
             .filter { it.isFile && it.extension == "java" }
-            .map { it.absolutePath }
-            .toList()
+            .forEach { javaFiles.add(it.absolutePath) }
+        
+        // Generated R.java files
+        genDir?.walkTopDown()
+            ?.filter { it.isFile && it.extension == "java" }
+            ?.forEach { javaFiles.add(it.absolutePath) }
 
         if (javaFiles.isEmpty()) {
             return BuildResult(false, errorLog = "No .java source files found in ${env.srcDir}")
@@ -239,14 +358,14 @@ class BuildEngine(
         val classpath = buildClasspath(env, deps)
 
         // Try ECJ (bundled as Gradle dependency, loaded via Class.forName)
-        val ecjResult = tryEcj(javaFiles, classpath, env.classesDir)
+        val ecjResult = tryEcj(javaFiles, classpath, env.classesDir, env.androidJar.absolutePath)
         if (ecjResult.success) return ecjResult
 
         // Fallback: any javac on the system
         return tryJavac(javaFiles, classpath, env.classesDir, ecjResult.errorLog ?: "ECJ failed")
     }
 
-    private fun tryEcj(javaFiles: List<String>, classpath: String, outputDir: File): BuildResult {
+    private fun tryEcj(javaFiles: List<String>, classpath: String, outputDir: File, androidJarPath: String): BuildResult {
         return try {
             val mainClass = Class.forName("org.eclipse.jdt.internal.compiler.batch.Main")
             Log.d(TAG, "ECJ class loaded successfully via Class.forName")
@@ -273,15 +392,22 @@ class BuildEngine(
                 ).newInstance(PrintWriter(outSw), PrintWriter(errSw), false, null, null)
             }
 
-            val args = (listOf("-source", "8", "-target", "8", "-cp", classpath,
+            val args = (listOf("-source", "8", "-target", "8",
+                "-bootclasspath", androidJarPath,
+                "-cp", classpath,
                 "-d", outputDir.absolutePath, "-encoding", "UTF-8", "-nowarn") + javaFiles).toTypedArray()
+
+            Log.d(TAG, "ECJ args: ${args.joinToString(" ")}")
 
             val success = mainClass.getMethod("compile", Array<String>::class.java)
                 .invoke(instance, args) as Boolean
 
             val errText = errSw.toString().trim()
+            val outText = outSw.toString().trim()
+            Log.d(TAG, "ECJ output: $outText")
+            Log.d(TAG, "ECJ errors: $errText")
             if (success) BuildResult(true)
-            else BuildResult(false, errorLog = errText.ifEmpty { "ECJ: Compilation failed" })
+            else BuildResult(false, errorLog = errText.ifEmpty { outText.ifEmpty { "ECJ: Compilation failed" } })
         } catch (e: ClassNotFoundException) {
             Log.e(TAG, "ECJ class not found on classpath", e)
             BuildResult(false, errorLog = "ECJ compiler class not found: ${e.message}")
@@ -331,14 +457,19 @@ class BuildEngine(
 
         val dexFile = File(env.dexDir, "classes.dex")
 
-        // Try dx.jar bundled in system
+        // Primary: D8 (bundled as Gradle dependency, pure Java — works on any Android device)
+        val d8Result = tryD8(env, classFiles, dexFile)
+        if (d8Result.success) return d8Result
+        Log.w(TAG, "D8 failed: ${d8Result.errorLog}")
+
+        // Fallback 1: dx.jar bundled in system
         tryDxJar(env, dexFile)?.let { if (it.success) return it }
 
-        // Try dx shell command
+        // Fallback 2: dx shell command
         tryShellCommand(listOf("dx", "--dex", "--output=${dexFile.absolutePath}", env.classesDir.absolutePath))
             .let { if (it.success && dexFile.exists()) return BuildResult(true) }
 
-        // Try Termux dx
+        // Fallback 3: Termux dx
         val termuxDx = "/data/data/com.termux/files/usr/bin/dx"
         if (File(termuxDx).canExecute()) {
             tryShellCommand(listOf(termuxDx, "--dex", "--output=${dexFile.absolutePath}", env.classesDir.absolutePath))
@@ -347,8 +478,77 @@ class BuildEngine(
 
         return BuildResult(
             false,
-            errorLog = "DEX conversion failed.\n\nInstall Termux from F-Droid then run:\n  pkg install dx\n\nThen tap Run again."
+            errorLog = "DEX conversion failed.\nD8 error: ${d8Result.errorLog}\n\n" +
+                    "Fallback: Install Termux from F-Droid then run:\n  pkg install dx\n\nThen tap Run again."
         )
+    }
+
+    /**
+     * Convert .class files to .dex using D8 (Google's modern DEX compiler).
+     * D8 is bundled as a Gradle dependency (com.android.tools:r8) and runs in pure Java.
+     */
+    private fun tryD8(env: BuildEnvironment, classFiles: List<File>, dexFile: File): BuildResult {
+        return try {
+            Log.d(TAG, "Attempting D8 dexing with ${classFiles.size} class files")
+
+            // Collect all dependency JARs for the D8 classpath (library classes)
+            val libClasspath = mutableListOf<Path>()
+            libClasspath.add(env.androidJar.toPath())
+
+            // Add any downloaded maven dependency JARs
+            val mavenCache = File(context.filesDir, "maven_cache")
+            if (mavenCache.exists()) {
+                mavenCache.walkTopDown()
+                    .filter { it.isFile && it.extension == "jar" }
+                    .forEach { libClasspath.add(it.toPath()) }
+            }
+
+            // Use D8 via reflection to avoid compile-time coupling issues
+            val d8Class = Class.forName("com.android.tools.r8.D8")
+            val d8CommandClass = Class.forName("com.android.tools.r8.D8Command")
+            val builderClass = Class.forName("com.android.tools.r8.D8Command\$Builder")
+
+            // Get D8Command.builder()
+            val builderMethod = d8CommandClass.getMethod("builder")
+            val builder = builderMethod.invoke(null)
+
+            // Add program files (.class files)
+            val addProgramFiles = builderClass.getMethod("addProgramFiles", Collection::class.java)
+            addProgramFiles.invoke(builder, classFiles.map { it.toPath() })
+
+            // Add library classpath (android.jar + dependencies)
+            val addLibFiles = builderClass.getMethod("addLibraryFiles", Collection::class.java)
+            addLibFiles.invoke(builder, libClasspath)
+
+            // Set output directory
+            val setOutput = builderClass.getMethod("setOutput", Path::class.java, Class.forName("com.android.tools.r8.OutputMode"))
+            val outputModeClass = Class.forName("com.android.tools.r8.OutputMode")
+            val dexOutputMode = outputModeClass.getField("DexIndexed").get(null)
+            setOutput.invoke(builder, env.dexDir.toPath(), dexOutputMode)
+
+            // Set min API level
+            val setMinApi = builderClass.getMethod("setMinApiLevel", Int::class.javaPrimitiveType)
+            setMinApi.invoke(builder, 26)
+
+            // Build the command
+            val buildMethod = builderClass.getMethod("build")
+            val d8Command = buildMethod.invoke(builder)
+
+            // Run D8
+            val runMethod = d8Class.getMethod("run", d8CommandClass)
+            runMethod.invoke(null, d8Command)
+
+            if (dexFile.exists() && dexFile.length() > 0) {
+                Log.d(TAG, "D8 dexing successful: ${dexFile.length()} bytes")
+                BuildResult(true)
+            } else {
+                BuildResult(false, errorLog = "D8 completed but produced no output")
+            }
+        } catch (e: Exception) {
+            val rootCause = generateSequence<Throwable>(e) { it.cause }.last()
+            Log.e(TAG, "D8 dexing failed", e)
+            BuildResult(false, errorLog = "D8 error: ${rootCause.message ?: e.message}")
+        }
     }
 
     private fun tryDxJar(env: BuildEnvironment, dexFile: File): BuildResult? {
@@ -405,8 +605,32 @@ class BuildEngine(
             if (r.success) return r
         }
 
+        // Pure-Java resource compiler (binary XML + resources.arsc, no native binary needed)
+        val pureJavaResult = tryPureJavaResources(resDir, manifestFile, outputApk, packageName)
+        if (pureJavaResult.success) return pureJavaResult
+
         // Last resort: bundle files as plain zip (works for simple apps without resources)
         return buildPlainResourcePackage(env, manifestFile, resDir, outputApk)
+    }
+
+    /**
+     * Compile resources using the pure-Java ResourceCompiler.
+     * Produces binary XML, resources.arsc, and a valid resources.ap_ package.
+     */
+    private fun tryPureJavaResources(resDir: File, manifestFile: File, outputApk: File, packageName: String): BuildResult {
+        return try {
+            val resourceCompiler = ResourceCompiler()
+            resourceCompiler.compile(resDir, manifestFile, outputApk, packageName)
+            if (outputApk.exists() && outputApk.length() > 0) {
+                Log.d(TAG, "Pure-Java resource compilation successful: ${outputApk.length()} bytes")
+                BuildResult(true)
+            } else {
+                BuildResult(false, errorLog = "Pure-Java resource compiler produced no output")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Pure-Java resource compilation failed: ${e.message}", e)
+            BuildResult(false, errorLog = "Resource compiler error: ${e.message}")
+        }
     }
 
     private fun tryAapt2(
@@ -556,33 +780,41 @@ class BuildEngine(
                 val cert = ks.getCertificate(alias) as java.security.cert.X509Certificate
                 return Pair(key, cert)
             } catch (e: Exception) {
+                Log.w(TAG, "Existing keystore invalid, regenerating: ${e.message}")
                 keystoreFile.delete()
             }
         }
 
-        // Generate via Android Keystore (no BouncyCastle needed)
-        val kpg = KeyPairGenerator.getInstance(
-            android.security.keystore.KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore"
-        )
-        kpg.initialize(
-            android.security.keystore.KeyGenParameterSpec.Builder(
-                "forge_signing_v1",
-                android.security.keystore.KeyProperties.PURPOSE_SIGN
-            )
-                .setKeySize(2048)
-                .setSignaturePaddings(android.security.keystore.KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
-                .setDigests(android.security.keystore.KeyProperties.DIGEST_SHA256)
-                .setCertificateSubject(javax.security.auth.x500.X500Principal("CN=Forge Debug"))
-                .setCertificateNotBefore(java.util.Date())
-                .setCertificateNotAfter(java.util.Date(System.currentTimeMillis() + 10000L * 86400000))
-                .build()
-        )
-        kpg.generateKeyPair()
+        // Generate key pair + self-signed cert using BouncyCastle (exportable, unlike AndroidKeyStore)
+        java.security.Security.addProvider(BouncyCastleProvider())
 
-        val ks = KeyStore.getInstance("AndroidKeyStore").also { it.load(null) }
-        val privateKey = ks.getKey("forge_signing_v1", null) as java.security.PrivateKey
-        val cert = ks.getCertificate("forge_signing_v1") as java.security.cert.X509Certificate
-        return Pair(privateKey, cert)
+        val kpg = KeyPairGenerator.getInstance("RSA")
+        kpg.initialize(2048, SecureRandom())
+        val keyPair = kpg.generateKeyPair()
+
+        val issuer = X500Name("CN=Forge Debug, O=Forge, C=US")
+        val serial = BigInteger.valueOf(System.currentTimeMillis())
+        val notBefore = Date()
+        val notAfter = Date(System.currentTimeMillis() + 10000L * 86400000) // ~27 years
+
+        val certBuilder = JcaX509v3CertificateBuilder(
+            issuer, serial, notBefore, notAfter, issuer, keyPair.public
+        )
+        val signer = JcaContentSignerBuilder("SHA256withRSA")
+            .setProvider("BC")
+            .build(keyPair.private)
+        val cert = JcaX509CertificateConverter()
+            .setProvider("BC")
+            .getCertificate(certBuilder.build(signer))
+
+        // Save to PKCS12 keystore
+        val ks = KeyStore.getInstance("PKCS12")
+        ks.load(null, password)
+        ks.setKeyEntry(alias, keyPair.private, password, arrayOf(cert))
+        FileOutputStream(keystoreFile).use { ks.store(it, password) }
+
+        Log.d(TAG, "Generated new debug signing key")
+        return Pair(keyPair.private, cert)
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -678,7 +910,7 @@ class BuildEngine(
 }
 
 // ─────────────────────────────────────────────────────────────────
-// APK v1 Signer (pure Java)
+// APK v1 Signer — proper PKCS#7 via BouncyCastle
 // ─────────────────────────────────────────────────────────────────
 
 class ApkSigner(
@@ -696,6 +928,7 @@ class ApkSigner(
             }
         }
 
+        // Build MANIFEST.MF with SHA-256 digests of every entry
         val sha256 = java.security.MessageDigest.getInstance("SHA-256")
         val manifest = StringBuilder("Manifest-Version: 1.0\r\nCreated-By: Forge\r\n\r\n")
         entries.forEach { (name, bytes) ->
@@ -704,22 +937,39 @@ class ApkSigner(
         }
         val manifestBytes = manifest.toString().toByteArray(Charsets.UTF_8)
 
+        // Build CERT.SF with manifest digest
         val certSfText = "Signature-Version: 1.0\r\nCreated-By: Forge\r\n" +
                 "SHA-256-Digest-Manifest: ${android.util.Base64.encodeToString(sha256.digest(manifestBytes), android.util.Base64.NO_WRAP)}\r\n\r\n"
         val certSfBytes = certSfText.toByteArray(Charsets.UTF_8)
 
-        val sig = java.security.Signature.getInstance("SHA256withRSA")
-        sig.initSign(privateKey)
-        sig.update(certSfBytes)
-        val sigBytes = sig.sign()
+        // Build CERT.RSA — proper PKCS#7 SignedData using BouncyCastle
+        java.security.Security.addProvider(BouncyCastleProvider())
 
+        val cmsGen = CMSSignedDataGenerator()
+        val contentSigner = JcaContentSignerBuilder("SHA256withRSA")
+            .setProvider("BC")
+            .build(privateKey)
+        val digestCalcProvider = JcaDigestCalculatorProviderBuilder()
+            .setProvider("BC")
+            .build()
+        cmsGen.addSignerInfoGenerator(
+            JcaSignerInfoGeneratorBuilder(digestCalcProvider)
+                .build(contentSigner, certificate)
+        )
+        cmsGen.addCertificate(org.bouncycastle.cert.jcajce.JcaX509CertificateHolder(certificate))
+
+        val cmsData = CMSProcessableByteArray(certSfBytes)
+        val signedData = cmsGen.generate(cmsData, false) // detached signature
+        val certRsaBytes = signedData.encoded
+
+        // Write signed APK
         ZipOutputStream(FileOutputStream(output)).use { zos ->
             entries.forEach { (name, bytes) ->
                 zos.putNextEntry(ZipEntry(name)); zos.write(bytes); zos.closeEntry()
             }
             zos.putNextEntry(ZipEntry("META-INF/MANIFEST.MF")); zos.write(manifestBytes); zos.closeEntry()
             zos.putNextEntry(ZipEntry("META-INF/CERT.SF")); zos.write(certSfBytes); zos.closeEntry()
-            zos.putNextEntry(ZipEntry("META-INF/CERT.RSA")); zos.write(sigBytes); zos.closeEntry()
+            zos.putNextEntry(ZipEntry("META-INF/CERT.RSA")); zos.write(certRsaBytes); zos.closeEntry()
         }
     }
 }
