@@ -46,8 +46,15 @@ class BuildEngine(
 ) {
     companion object {
         private const val TAG = "ForgeBuilder"
+        // Primary download URL for android.jar (API 26 — matches minSdk)
         private const val ANDROID_JAR_URL =
-            "https://github.com/Reginer/aosp-android-jar/raw/main/android-26/android.jar"
+            "https://github.com/nicksay/aosp-jars/raw/main/android-26-api.jar"
+        // Fallback URLs in case primary fails
+        private val ANDROID_JAR_FALLBACK_URLS = listOf(
+            "https://github.com/nicksay/aosp-jars/raw/main/android-26-api.jar",
+            "https://github.com/nicksay/aosp-jars/raw/main/android-28-api.jar",
+            "https://raw.githubusercontent.com/nicksay/aosp-jars/main/android-26-api.jar"
+        )
     }
 
     private val toolsDir = File(context.filesDir, "forge_tools").also { it.mkdirs() }
@@ -164,14 +171,79 @@ class BuildEngine(
     // ─────────────────────────────────────────────────────────────────
 
     private fun ensureBuildTools(log: suspend (String) -> Unit): Boolean {
-        if (!androidJar.exists()) {
-            Log.d(TAG, "Downloading android.jar...")
-            if (!downloadFile(ANDROID_JAR_URL, androidJar)) {
-                Log.e(TAG, "Failed to download android.jar")
-                return false
+        // Check if we already have a valid android.jar
+        if (androidJar.exists()) {
+            if (isValidAndroidJar(androidJar)) {
+                Log.d(TAG, "android.jar exists and is valid (${androidJar.length()} bytes)")
+                return true
+            } else {
+                Log.e(TAG, "[BUILD] android.jar exists but is INVALID (${androidJar.length()} bytes) — deleting and re-downloading")
+                androidJar.delete()
             }
         }
-        return true
+
+        // Try downloading from primary URL first, then fallbacks
+        val allUrls = listOf(ANDROID_JAR_URL) + ANDROID_JAR_FALLBACK_URLS
+        for ((index, url) in allUrls.distinct().withIndex()) {
+            Log.d(TAG, "[BUILD] Attempting android.jar download (attempt ${index + 1}/${allUrls.distinct().size}): $url")
+            if (downloadFile(url, androidJar)) {
+                if (isValidAndroidJar(androidJar)) {
+                    Log.d(TAG, "[BUILD] ✓ android.jar downloaded and validated: ${androidJar.length()} bytes")
+                    return true
+                } else {
+                    Log.e(TAG, "[BUILD] ✗ Downloaded file is not a valid android.jar (${androidJar.length()} bytes), trying next URL...")
+                    androidJar.delete()
+                }
+            } else {
+                Log.e(TAG, "[BUILD] ✗ Download failed from: $url")
+            }
+        }
+
+        Log.e(TAG, "[BUILD] CRITICAL: Could not obtain a valid android.jar from any source")
+        return false
+    }
+
+    /**
+     * Validate that a file is a real android.jar by checking:
+     * 1. It's large enough (real android.jar is > 1MB)
+     * 2. It has ZIP magic bytes (PK header)
+     * 3. It contains java/lang/Object.class (the most fundamental class)
+     */
+    private fun isValidAndroidJar(file: File): Boolean {
+        if (!file.exists()) return false
+        if (file.length() < 100_000) { // Any real android.jar is > 100KB
+            Log.w(TAG, "[BUILD] android.jar too small: ${file.length()} bytes (expected >100KB)")
+            return false
+        }
+        return try {
+            // Check ZIP magic bytes
+            val header = ByteArray(4)
+            file.inputStream().use { it.read(header) }
+            if (header[0] != 0x50.toByte() || header[1] != 0x4B.toByte()) {
+                Log.w(TAG, "[BUILD] android.jar has invalid magic bytes (not a ZIP): ${header.map { "%02x".format(it) }}")
+                return false
+            }
+            // Check for java/lang/Object.class inside the JAR
+            var hasObjectClass = false
+            ZipInputStream(file.inputStream()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (entry.name == "java/lang/Object.class") {
+                        hasObjectClass = true
+                        break
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            if (!hasObjectClass) {
+                Log.w(TAG, "[BUILD] android.jar missing java/lang/Object.class — not a valid Android platform JAR")
+            }
+            hasObjectClass
+        } catch (e: Exception) {
+            Log.e(TAG, "[BUILD] android.jar validation error: ${e.message}")
+            false
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -352,10 +424,29 @@ class BuildEngine(
             ?.forEach { javaFiles.add(it.absolutePath) }
 
         if (javaFiles.isEmpty()) {
+            Log.e(TAG, "[BUILD] No .java source files found in ${env.srcDir.absolutePath}")
             return BuildResult(false, errorLog = "No .java source files found in ${env.srcDir}")
         }
 
+        Log.d(TAG, "[BUILD] Found ${javaFiles.size} Java files to compile")
+        javaFiles.forEach { Log.d(TAG, "[BUILD]   → $it") }
+
+        // Pre-flight check: validate android.jar before compilation
+        if (!env.androidJar.exists()) {
+            Log.e(TAG, "[BUILD] CRITICAL: android.jar not found at ${env.androidJar.absolutePath}")
+            return BuildResult(false, errorLog = "android.jar not found at ${env.androidJar.absolutePath}. " +
+                    "Check your internet connection and restart the build.")
+        }
+        if (!isValidAndroidJar(env.androidJar)) {
+            Log.e(TAG, "[BUILD] CRITICAL: android.jar is invalid (${env.androidJar.length()} bytes)")
+            env.androidJar.delete() // Force re-download next time
+            return BuildResult(false, errorLog = "android.jar is corrupted (${env.androidJar.length()} bytes). " +
+                    "It has been deleted — tap Run again to re-download.")
+        }
+
         val classpath = buildClasspath(env, deps)
+        Log.d(TAG, "[BUILD] Classpath: $classpath")
+        Log.d(TAG, "[BUILD] Bootclasspath: ${env.androidJar.absolutePath} (${env.androidJar.length()} bytes)")
 
         // Try ECJ (bundled as Gradle dependency, loaded via Class.forName)
         val ecjResult = tryEcj(javaFiles, classpath, env.classesDir, env.androidJar.absolutePath)
@@ -368,7 +459,7 @@ class BuildEngine(
     private fun tryEcj(javaFiles: List<String>, classpath: String, outputDir: File, androidJarPath: String): BuildResult {
         return try {
             val mainClass = Class.forName("org.eclipse.jdt.internal.compiler.batch.Main")
-            Log.d(TAG, "ECJ class loaded successfully via Class.forName")
+            Log.d(TAG, "[BUILD] ECJ class loaded successfully")
 
             val errSw = StringWriter()
             val outSw = StringWriter()
@@ -382,7 +473,7 @@ class BuildEngine(
                     Boolean::class.javaPrimitiveType
                 ).newInstance(PrintWriter(outSw), PrintWriter(errSw), false)
             } catch (e: NoSuchMethodException) {
-                Log.d(TAG, "3-arg constructor not found, trying 5-arg")
+                Log.d(TAG, "[BUILD] ECJ 3-arg constructor not found, trying 5-arg")
                 mainClass.getConstructor(
                     PrintWriter::class.java,
                     PrintWriter::class.java,
@@ -397,19 +488,28 @@ class BuildEngine(
                 "-cp", classpath,
                 "-d", outputDir.absolutePath, "-encoding", "UTF-8", "-nowarn") + javaFiles).toTypedArray()
 
-            Log.d(TAG, "ECJ args: ${args.joinToString(" ")}")
+            Log.d(TAG, "[BUILD] ECJ bootclasspath: $androidJarPath")
+            Log.d(TAG, "[BUILD] ECJ output dir: ${outputDir.absolutePath}")
+            Log.d(TAG, "[BUILD] ECJ compiling ${javaFiles.size} files...")
 
             val success = mainClass.getMethod("compile", Array<String>::class.java)
                 .invoke(instance, args) as Boolean
 
             val errText = errSw.toString().trim()
             val outText = outSw.toString().trim()
-            Log.d(TAG, "ECJ output: $outText")
-            Log.d(TAG, "ECJ errors: $errText")
-            if (success) BuildResult(true)
-            else BuildResult(false, errorLog = errText.ifEmpty { outText.ifEmpty { "ECJ: Compilation failed" } })
+
+            if (success) {
+                Log.d(TAG, "[BUILD] ✓ ECJ compilation successful")
+                if (outText.isNotEmpty()) Log.d(TAG, "[BUILD] ECJ output: $outText")
+                BuildResult(true)
+            } else {
+                Log.e(TAG, "[BUILD] ✗ ECJ compilation FAILED")
+                if (errText.isNotEmpty()) Log.e(TAG, "[BUILD] ECJ errors:\n$errText")
+                if (outText.isNotEmpty()) Log.e(TAG, "[BUILD] ECJ output:\n$outText")
+                BuildResult(false, errorLog = errText.ifEmpty { outText.ifEmpty { "ECJ: Compilation failed" } })
+            }
         } catch (e: ClassNotFoundException) {
-            Log.e(TAG, "ECJ class not found on classpath", e)
+            Log.e(TAG, "[BUILD] ECJ class not found on classpath", e)
             BuildResult(false, errorLog = "ECJ compiler class not found: ${e.message}")
         } catch (e: Exception) {
             Log.e(TAG, "ECJ failed", e)
