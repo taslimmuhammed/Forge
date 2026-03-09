@@ -179,11 +179,10 @@ class ChatViewModel(
                 error.contains("inaccessible or not found", ignoreCase = true) ||
                 error.contains("No Java", ignoreCase = true)) {
                 addSystemMessage(
-                    "No Java compiler found on device.\n\n" +
-                            "To build apps you need Termux with OpenJDK:\n" +
-                            "1. Install Termux from F-Droid (not Play Store)\n" +
-                            "2. Open Termux and run: pkg install openjdk-17\n" +
-                            "3. Come back and tap Run again.\n\n" +
+                    "Java compilation failed on device.\n\n" +
+                            "The bundled ECJ compiler encountered an error. " +
+                            "Please check the build log for details.\n\n" +
+                            "If the issue persists, try clearing the app data and rebuilding.\n\n" +
                             "Alternatively, enter your API key so Forge can help debug build issues."
                 )
             } else {

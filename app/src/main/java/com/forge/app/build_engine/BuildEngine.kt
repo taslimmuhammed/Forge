@@ -11,6 +11,7 @@ import com.forge.app.data.models.BuildResult
 import com.forge.app.data.models.DependencySpec
 import com.forge.app.data.repository.ProjectFileManager
 import dalvik.system.DexClassLoader
+
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.flow.Flow
@@ -31,15 +32,11 @@ class BuildEngine(
 ) {
     companion object {
         private const val TAG = "ForgeBuilder"
-        private const val ECJ_VERSION = "3.26.0"
-        private const val ECJ_JAR_URL =
-            "https://repo1.maven.org/maven2/org/eclipse/jdt/ecj/$ECJ_VERSION/ecj-$ECJ_VERSION.jar"
         private const val ANDROID_JAR_URL =
             "https://github.com/Reginer/aosp-android-jar/raw/main/android-26/android.jar"
     }
 
     private val toolsDir = File(context.filesDir, "forge_tools").also { it.mkdirs() }
-    private val ecjJar get() = File(toolsDir, "ecj-$ECJ_VERSION.jar")
     private val androidJar get() = File(toolsDir, "android.jar")
 
     // ─────────────────────────────────────────────────────────────────
@@ -135,15 +132,6 @@ class BuildEngine(
     // ─────────────────────────────────────────────────────────────────
 
     private fun ensureBuildTools(log: suspend (String) -> Unit): Boolean {
-        if (!ecjJar.exists()) {
-            // log is suspend but we're in a blocking context — call synchronously via runBlocking
-            // Actually we're already on IO dispatcher, so call a non-suspend version
-            Log.d(TAG, "Downloading ECJ...")
-            if (!downloadFile(ECJ_JAR_URL, ecjJar)) {
-                Log.e(TAG, "Failed to download ECJ")
-                return false
-            }
-        }
         if (!androidJar.exists()) {
             Log.d(TAG, "Downloading android.jar...")
             if (!downloadFile(ANDROID_JAR_URL, androidJar)) {
@@ -250,30 +238,40 @@ class BuildEngine(
 
         val classpath = buildClasspath(env, deps)
 
-        // Try ECJ (loaded from downloaded JAR via DexClassLoader)
+        // Try ECJ (bundled as Gradle dependency, loaded via Class.forName)
         val ecjResult = tryEcj(javaFiles, classpath, env.classesDir)
         if (ecjResult.success) return ecjResult
 
         // Fallback: any javac on the system
-        return tryJavac(javaFiles, classpath, env.classesDir)
+        return tryJavac(javaFiles, classpath, env.classesDir, ecjResult.errorLog ?: "ECJ failed")
     }
 
     private fun tryEcj(javaFiles: List<String>, classpath: String, outputDir: File): BuildResult {
-        if (!ecjJar.exists()) return BuildResult(false, errorLog = "ECJ jar not found")
         return try {
-            val ecjDexDir = File(toolsDir, "ecj_dex").also { it.mkdirs() }
-            val loader = DexClassLoader(ecjJar.absolutePath, ecjDexDir.absolutePath, null, context.classLoader)
-            val mainClass = loader.loadClass("org.eclipse.jdt.internal.compiler.batch.Main")
+            val mainClass = Class.forName("org.eclipse.jdt.internal.compiler.batch.Main")
+            Log.d(TAG, "ECJ class loaded successfully via Class.forName")
 
             val errSw = StringWriter()
             val outSw = StringWriter()
-            val instance = mainClass.getConstructor(
-                PrintWriter::class.java,
-                PrintWriter::class.java,
-                Boolean::class.javaPrimitiveType,
-                java.util.Map::class.java,
-                Any::class.java
-            ).newInstance(PrintWriter(outSw), PrintWriter(errSw), false, null, null)
+
+            // Try the 3-arg constructor first (PrintWriter, PrintWriter, boolean)
+            // then fall back to 5-arg if needed
+            val instance = try {
+                mainClass.getConstructor(
+                    PrintWriter::class.java,
+                    PrintWriter::class.java,
+                    Boolean::class.javaPrimitiveType
+                ).newInstance(PrintWriter(outSw), PrintWriter(errSw), false)
+            } catch (e: NoSuchMethodException) {
+                Log.d(TAG, "3-arg constructor not found, trying 5-arg")
+                mainClass.getConstructor(
+                    PrintWriter::class.java,
+                    PrintWriter::class.java,
+                    Boolean::class.javaPrimitiveType,
+                    java.util.Map::class.java,
+                    Any::class.java
+                ).newInstance(PrintWriter(outSw), PrintWriter(errSw), false, null, null)
+            }
 
             val args = (listOf("-source", "8", "-target", "8", "-cp", classpath,
                 "-d", outputDir.absolutePath, "-encoding", "UTF-8", "-nowarn") + javaFiles).toTypedArray()
@@ -284,13 +282,17 @@ class BuildEngine(
             val errText = errSw.toString().trim()
             if (success) BuildResult(true)
             else BuildResult(false, errorLog = errText.ifEmpty { "ECJ: Compilation failed" })
+        } catch (e: ClassNotFoundException) {
+            Log.e(TAG, "ECJ class not found on classpath", e)
+            BuildResult(false, errorLog = "ECJ compiler class not found: ${e.message}")
         } catch (e: Exception) {
-            Log.w(TAG, "ECJ failed: ${e.message}")
-            BuildResult(false, errorLog = "ECJ error: ${e.message}")
+            Log.e(TAG, "ECJ failed", e)
+            val rootCause = e.cause?.message ?: e.message
+            BuildResult(false, errorLog = "ECJ error: $rootCause")
         }
     }
 
-    private fun tryJavac(javaFiles: List<String>, classpath: String, outputDir: File): BuildResult {
+    private fun tryJavac(javaFiles: List<String>, classpath: String, outputDir: File, ecjError: String = ""): BuildResult {
         val candidates = listOf(
             "javac",
             "/data/data/com.termux/files/usr/bin/javac",
@@ -314,7 +316,8 @@ class BuildEngine(
         return BuildResult(
             false,
             errorLog = "No Java compiler found.\n\n" +
-                    "Install Termux from F-Droid then run:\n  pkg install openjdk-17\n\nThen tap Run again."
+                    "ECJ compiler error: $ecjError\n\n" +
+                    "Please report this issue — the bundled ECJ compiler should have worked."
         )
     }
 

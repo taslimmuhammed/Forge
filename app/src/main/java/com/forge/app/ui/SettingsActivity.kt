@@ -76,11 +76,12 @@ class SettingsActivity : AppCompatActivity() {
                 .setMessage("""
 For the best build experience, install Termux from F-Droid and run:
 
-pkg install openjdk-17
 pkg install aapt
 pkg install apksigner
 
-This gives Forge a complete Java build toolchain. Without it, builds rely on system binaries which may not be available on all devices.
+Java compilation is handled by the bundled ECJ compiler (no JDK needed).
+
+Termux provides aapt (resource packaging) and apksigner (APK signing) which improve build reliability on devices without these system binaries.
 
 Note: Install Termux from F-Droid (not Play Store) for full functionality.
                 """.trimIndent())

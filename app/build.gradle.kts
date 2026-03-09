@@ -51,6 +51,20 @@ android {
     configurations.all {
         exclude(group = "org.jetbrains", module = "annotations-java5")
     }
+
+    // Include javax stubs (needed at runtime on Android where java.compiler module doesn't exist)
+    sourceSets {
+        getByName("main") {
+            java.srcDir("src/main/stubs")
+        }
+    }
+}
+
+// Allow javax stubs to coexist with the JDK's java.compiler module at compile time
+tasks.withType<JavaCompile>().configureEach {
+    options.compilerArgs.addAll(listOf(
+        "--patch-module", "java.compiler=${project.file("src/main/stubs").absolutePath}"
+    ))
 }
 
 dependencies {
@@ -115,6 +129,15 @@ dependencies {
 
     // Zip handling
     implementation("net.lingala.zip4j:zip4j:2.11.5")
+
+    // ECJ (Eclipse Java Compiler) — bundled for on-device Java compilation
+    // Using 3.12.3: oldest version on Maven Central, supports Java 8, no javax.lang.model dependency
+    // (Newer ECJ versions reference javax.lang.model.SourceVersion which doesn't exist on Android)
+    implementation("org.eclipse.jdt:ecj:3.12.3")
+
+    // javax stubs — must be `implementation` (not compileOnly) so they're packaged into the APK
+    // These classes exist in the JDK on the Mac but NOT on Android's runtime
+    implementation(project(":stubs-library"))
 
 
     testImplementation(libs.junit)
