@@ -1,6 +1,7 @@
 package com.forge.app.ui.chat
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.*
 import com.forge.app.agent.AgentStreamEvent
 import com.forge.app.agent.ForgeAgent
@@ -29,6 +30,10 @@ class ChatViewModel(
     application: Application,
     private val projectId: String
 ) : AndroidViewModel(application) {
+    companion object {
+        private const val TAG = "ForgeBuildLog"
+        private const val LOGCAT_CHUNK_SIZE = 3500
+    }
 
     private val repository = ProjectRepository(application)
     private var fileManager: ProjectFileManager? = null
@@ -61,13 +66,25 @@ class ChatViewModel(
             agent = ForgeAgent(getApplication(), fileManager!!, proj)
             buildEngine = BuildEngine(getApplication(), fileManager!!)
             chatHistoryManager = ChatHistoryManager(getApplication(), projectId)
+            val migratedLegacyBoilerplate = fileManager!!.migrateLegacyBoilerplateIfNeeded()
 
             // Load persisted chat history
             val history = chatHistoryManager!!.loadMessages(projectId)
             if (history.isNotEmpty()) {
                 _messages.value = history
+                if (migratedLegacyBoilerplate) {
+                    addSystemMessage(
+                        "Updated legacy AppCompat boilerplate to offline-friendly Activity template. " +
+                                "Tap Run again."
+                    )
+                }
             } else {
                 addSystemMessage("Project loaded: **${proj.name}**\n\nTap ▶ Run to build and install the boilerplate app, or describe what you want to build!")
+                if (migratedLegacyBoilerplate) {
+                    addSystemMessage(
+                        "Legacy AppCompat boilerplate was migrated to offline-friendly Activity template."
+                    )
+                }
             }
         }
     }
@@ -151,7 +168,18 @@ class ChatViewModel(
                         lastBuildError = event.message
                         buildLogBuffer.appendLine("ERROR: ${event.message}")
                         _buildLog.value = buildLogBuffer.toString()
-                        addErrorMessage("Build failed: ${event.message.take(300)}")
+                        addErrorMessage("Build failed:\n${event.message}")
+                        logLongError("Build failed for ${proj.packageName}:\n${event.message}")
+                        logLongError("Full build log:\n${buildLogBuffer}")
+                        if (event.message.contains("AppCompatActivity", ignoreCase = true) &&
+                            event.message.contains("cannot be resolved", ignoreCase = true)
+                        ) {
+                            addSystemMessage(
+                                "Dependency download likely failed (`androidx.appcompat`). " +
+                                        "For offline builds, use `android.app.Activity` instead of `AppCompatActivity` " +
+                                        "or reconnect internet and rebuild."
+                            )
+                        }
                         _uiState.value = ChatUiState.Idle
                         // Only attempt auto-repair if we have an API key AND
                         // it's a code/compile error (not a missing-tool error)
@@ -281,6 +309,14 @@ class ChatViewModel(
     private fun addMessage(message: ChatMessage) {
         _messages.value = _messages.value + message
         chatHistoryManager?.appendMessage(message)
+    }
+
+    private fun logLongError(message: String) {
+        if (message.isBlank()) return
+        val chunks = message.chunked(LOGCAT_CHUNK_SIZE)
+        chunks.forEachIndexed { index, chunk ->
+            Log.e(TAG, "[${index + 1}/${chunks.size}] $chunk")
+        }
     }
 
     class Factory(private val application: Application, private val projectId: String) : ViewModelProvider.Factory {

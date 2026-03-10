@@ -40,6 +40,75 @@ class ProjectFileManager(
         initFileHashes()
     }
 
+    /**
+     * Migrates old default boilerplate that depended on AppCompat to an
+     * offline-friendly framework Activity template.
+     */
+    fun migrateLegacyBoilerplateIfNeeded(): Boolean {
+        var changed = false
+
+        val mainActivityPath = "app/src/main/java/${project.domain}/${project.appName}/MainActivity.java"
+        readFile(mainActivityPath)?.let { content ->
+            if (content.contains("import androidx.appcompat.app.AppCompatActivity;") &&
+                content.contains("extends AppCompatActivity")
+            ) {
+                var updated = content
+                updated = updated.replace(
+                    "import androidx.appcompat.app.AppCompatActivity;",
+                    "import android.app.Activity;"
+                )
+                updated = updated.replace("extends AppCompatActivity", "extends Activity")
+                if (updated != content) {
+                    writeFile(mainActivityPath, updated)
+                    changed = true
+                }
+            }
+        }
+
+        val manifestPath = "app/src/main/AndroidManifest.xml"
+        readFile(manifestPath)?.let { content ->
+            val updated = content.replace(
+                "@style/Theme.AppCompat.Light.DarkActionBar",
+                "@style/AppTheme"
+            )
+            if (updated != content) {
+                writeFile(manifestPath, updated)
+                changed = true
+            }
+        }
+
+        val stylesPath = "app/src/main/res/values/styles.xml"
+        readFile(stylesPath)?.let { content ->
+            var updated = content.replace(
+                "parent=\"Theme.AppCompat.Light.DarkActionBar\"",
+                "parent=\"@android:style/Theme.Material.Light.NoActionBar\""
+            )
+            updated = updated
+                .replace(Regex("""\s*<item name="colorPrimary">.*</item>\s*\n?"""), "")
+                .replace(Regex("""\s*<item name="colorPrimaryDark">.*</item>\s*\n?"""), "")
+                .replace(Regex("""\s*<item name="colorAccent">.*</item>\s*\n?"""), "")
+            if (updated != content) {
+                writeFile(stylesPath, updated.trimEnd())
+                changed = true
+            }
+        }
+
+        listOf("app/build.gradle", "app/build.gradle.kts").forEach { path ->
+            readFile(path)?.let { content ->
+                val updated = content.lines()
+                    .filterNot { it.contains("androidx.appcompat:appcompat") }
+                    .joinToString("\n")
+                if (updated != content) {
+                    writeFile(path, updated)
+                    changed = true
+                }
+            }
+        }
+
+        if (changed) updateFileHashes()
+        return changed
+    }
+
     private fun writeBoilerplate() {
         // AndroidManifest.xml
         writeFile("app/src/main/AndroidManifest.xml", """
@@ -52,7 +121,7 @@ class ProjectFileManager(
         android:label="${project.name}"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+        android:theme="@style/AppTheme">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -71,9 +140,9 @@ class ProjectFileManager(
 package ${project.packageName};
 
 import android.os.Bundle;
-import androidx.appcompat.app.AppCompatActivity;
+import android.app.Activity;
 
-public class MainActivity extends AppCompatActivity {
+public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -136,10 +205,7 @@ public class MainActivity extends AppCompatActivity {
         // styles.xml
         writeFile("app/src/main/res/values/styles.xml", """
 <resources>
-    <style name="AppTheme" parent="Theme.AppCompat.Light.DarkActionBar">
-        <item name="colorPrimary">@color/colorPrimary</item>
-        <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
-        <item name="colorAccent">@color/colorAccent</item>
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
     </style>
 </resources>
         """.trimIndent())
@@ -160,7 +226,6 @@ android {
 }
 
 dependencies {
-    implementation 'androidx.appcompat:appcompat:1.6.1'
 }
         """.trimIndent())
     }
@@ -174,13 +239,13 @@ dependencies {
 ## Current State
 - Screens: [MainActivity]
 - Activities: 1
-- Dependencies: [androidx.appcompat:appcompat:1.6.1]
+- Dependencies: []
 - Features: [Basic boilerplate, LinearLayout with welcome text]
 - Last build: Never
 
 ## Architecture Decisions
 - Single Activity architecture to start
-- Using AppCompat theme for broad device support
+- Use framework Activity/theme by default for offline-friendly first build
 
 ## Known Issues
 (none)

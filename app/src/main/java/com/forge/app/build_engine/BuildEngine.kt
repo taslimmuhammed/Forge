@@ -46,14 +46,13 @@ class BuildEngine(
 ) {
     companion object {
         private const val TAG = "ForgeBuilder"
-        // Primary download URL for android.jar (API 26 — matches minSdk)
-        private const val ANDROID_JAR_URL =
-            "https://github.com/nicksay/aosp-jars/raw/main/android-26-api.jar"
-        // Fallback URLs in case primary fails
-        private val ANDROID_JAR_FALLBACK_URLS = listOf(
+        private const val BUNDLED_ANDROID_JAR_ASSET = "android.jar"
+        // Network fallback URLs if bundled tool extraction is not available.
+        private val ANDROID_JAR_URLS = listOf(
+            "https://raw.githubusercontent.com/nicksay/aosp-jars/main/android-26-api.jar",
+            "https://cdn.jsdelivr.net/gh/nicksay/aosp-jars@main/android-26-api.jar",
             "https://github.com/nicksay/aosp-jars/raw/main/android-26-api.jar",
-            "https://github.com/nicksay/aosp-jars/raw/main/android-28-api.jar",
-            "https://raw.githubusercontent.com/nicksay/aosp-jars/main/android-26-api.jar"
+            "https://repo1.maven.org/maven2/com/google/android/android/4.1.1.4/android-4.1.1.4.jar"
         )
     }
 
@@ -87,7 +86,8 @@ class BuildEngine(
             send(BuildEvent.Log("🔧 Checking build tools..."))
             if (!ensureBuildTools { msg -> send(BuildEvent.Log(msg)) }) {
                 send(BuildEvent.Error(
-                    "Could not download build tools. Check your internet connection and try again."
+                    "Could not prepare build tools. Check your connection and retry. " +
+                            "If this keeps failing, reinstall Forge to restore bundled offline tools."
                 ))
                 return
             }
@@ -170,7 +170,7 @@ class BuildEngine(
     // STEP 1 — Download build tools (ECJ + android.jar)
     // ─────────────────────────────────────────────────────────────────
 
-    private fun ensureBuildTools(log: suspend (String) -> Unit): Boolean {
+    private suspend fun ensureBuildTools(log: suspend (String) -> Unit): Boolean {
         // Check if we already have a valid android.jar
         if (androidJar.exists()) {
             if (isValidAndroidJar(androidJar)) {
@@ -182,13 +182,26 @@ class BuildEngine(
             }
         }
 
-        // Try downloading from primary URL first, then fallbacks
-        val allUrls = listOf(ANDROID_JAR_URL) + ANDROID_JAR_FALLBACK_URLS
-        for ((index, url) in allUrls.distinct().withIndex()) {
-            Log.d(TAG, "[BUILD] Attempting android.jar download (attempt ${index + 1}/${allUrls.distinct().size}): $url")
+        // Offline-first: extract bundled android.jar asset from the APK.
+        if (extractBundledAndroidJar()) {
+            if (isValidAndroidJar(androidJar)) {
+                log("  ✓ Using bundled Android platform stubs")
+                Log.d(TAG, "[BUILD] ✓ Using bundled android.jar (${androidJar.length()} bytes)")
+                return true
+            }
+            Log.e(TAG, "[BUILD] Bundled android.jar is invalid (${androidJar.length()} bytes)")
+            androidJar.delete()
+        } else {
+            log("  ↳ Bundled platform stubs unavailable, trying network download")
+        }
+
+        // Network fallback when bundled asset isn't available.
+        for ((index, url) in ANDROID_JAR_URLS.distinct().withIndex()) {
+            Log.d(TAG, "[BUILD] Attempting android.jar download (attempt ${index + 1}/${ANDROID_JAR_URLS.distinct().size}): $url")
             if (downloadFile(url, androidJar)) {
                 if (isValidAndroidJar(androidJar)) {
                     Log.d(TAG, "[BUILD] ✓ android.jar downloaded and validated: ${androidJar.length()} bytes")
+                    log("  ✓ Downloaded Android platform stubs")
                     return true
                 } else {
                     Log.e(TAG, "[BUILD] ✗ Downloaded file is not a valid android.jar (${androidJar.length()} bytes), trying next URL...")
@@ -201,6 +214,31 @@ class BuildEngine(
 
         Log.e(TAG, "[BUILD] CRITICAL: Could not obtain a valid android.jar from any source")
         return false
+    }
+
+    private fun extractBundledAndroidJar(): Boolean {
+        val tmp = File(toolsDir, "android.jar.asset.tmp")
+        return try {
+            context.assets.open(BUNDLED_ANDROID_JAR_ASSET).use { input ->
+                tmp.outputStream().use { output -> input.copyTo(output) }
+            }
+            if (!tmp.exists() || tmp.length() == 0L) return false
+
+            val moved = tmp.renameTo(androidJar)
+            if (!moved) {
+                tmp.copyTo(androidJar, overwrite = true)
+                tmp.delete()
+            }
+            androidJar.exists() && androidJar.length() > 0
+        } catch (e: FileNotFoundException) {
+            Log.w(TAG, "[BUILD] Bundled android.jar asset not found")
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "[BUILD] Failed extracting bundled android.jar: ${e.message}")
+            false
+        } finally {
+            if (tmp.exists()) tmp.delete()
+        }
     }
 
     /**
@@ -452,8 +490,25 @@ class BuildEngine(
         val ecjResult = tryEcj(javaFiles, classpath, env.classesDir, env.androidJar.absolutePath)
         if (ecjResult.success) return ecjResult
 
+        // If ECJ produced regular compile diagnostics, surface them directly.
+        // Fallback to javac only when ECJ itself is unavailable/broken.
+        val ecjError = ecjResult.errorLog.orEmpty()
+        if (ecjError.isNotBlank() && !shouldFallbackToJavac(ecjError)) {
+            return ecjResult
+        }
+
         // Fallback: any javac on the system
-        return tryJavac(javaFiles, classpath, env.classesDir, ecjResult.errorLog ?: "ECJ failed")
+        return tryJavac(javaFiles, classpath, env.classesDir, ecjError.ifBlank { "ECJ failed" })
+    }
+
+    private fun shouldFallbackToJavac(ecjError: String): Boolean {
+        val msg = ecjError.lowercase()
+        if (msg.isBlank()) return true
+        return msg.contains("ecj compiler class not found") ||
+                msg.startsWith("ecj error:") ||
+                msg.contains("classnotfoundexception") ||
+                msg.contains("nosuchmethodexception") ||
+                msg.contains("invocationtargetexception")
     }
 
     private fun tryEcj(javaFiles: List<String>, classpath: String, outputDir: File, androidJarPath: String): BuildResult {

@@ -1,13 +1,18 @@
 package com.forge.app.ui.chat
 
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Typeface
 import android.os.Bundle
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
+import android.widget.ScrollView
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
@@ -31,6 +36,7 @@ class ChatActivity : AppCompatActivity() {
     }
 
     private lateinit var binding: ActivityChatBinding
+    private var latestBuildLog: String = ""
     private val viewModel: ChatViewModel by viewModels {
         ChatViewModel.Factory(
             application,
@@ -60,6 +66,7 @@ class ChatActivity : AppCompatActivity() {
         setupToolbar()
         setupChat()
         setupBuildButton()
+        setupBuildLogSheet()
         observeViewModel()
         registerInstallReceiver()
         checkInstallPermission()
@@ -92,6 +99,11 @@ class ChatActivity : AppCompatActivity() {
             }
             viewModel.buildAndRun()
         }
+    }
+
+    private fun setupBuildLogSheet() {
+        binding.buildLogSheet.setOnClickListener { openFullBuildLog() }
+        binding.tvBuildLog.setOnClickListener { openFullBuildLog() }
     }
 
     private fun checkInstallPermission() {
@@ -149,7 +161,11 @@ class ChatActivity : AppCompatActivity() {
         }
         lifecycleScope.launch {
             viewModel.buildLog.collect { log ->
-                if (log.isNotBlank()) { binding.tvBuildLog.text = log; binding.buildLogSheet.visibility = View.VISIBLE }
+                latestBuildLog = log
+                if (log.isNotBlank()) {
+                    binding.tvBuildLog.text = previewBuildLog(log)
+                    binding.buildLogSheet.visibility = View.VISIBLE
+                }
             }
         }
     }
@@ -225,6 +241,43 @@ class ChatActivity : AppCompatActivity() {
             .setMessage(message)
             .setPositiveButton("Proceed") { _, _ -> viewModel.confirmPendingOperation(pendingResponse) }
             .setNegativeButton("Cancel") { _, _ -> viewModel.cancelPendingOperation() }.show()
+    }
+
+    private fun openFullBuildLog() {
+        if (latestBuildLog.isBlank()) return
+        val textView = TextView(this).apply {
+            text = latestBuildLog
+            textSize = 12f
+            setTextColor(0xFF58A6FF.toInt())
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(32, 24, 32, 24)
+        }
+        val scrollView = ScrollView(this).apply { addView(textView) }
+
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Full Build Log")
+            .setView(scrollView)
+            .setPositiveButton("Copy") { _, _ -> copyBuildLog(latestBuildLog) }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun previewBuildLog(log: String): String {
+        val trimmed = log.trimEnd()
+        val maxChars = 6000
+        val body = if (trimmed.length > maxChars) {
+            "... (showing last $maxChars chars)\n${trimmed.takeLast(maxChars)}"
+        } else {
+            trimmed
+        }
+        return "$body\n\n(Tap to open full log)"
+    }
+
+    private fun copyBuildLog(log: String) {
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Forge Build Log", log))
+        Toast.makeText(this, "Build log copied", Toast.LENGTH_SHORT).show()
     }
 
     private fun registerInstallReceiver() {
