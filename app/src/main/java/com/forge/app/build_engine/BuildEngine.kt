@@ -27,6 +27,7 @@ import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.SecureRandom
 import java.util.Date
+import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -881,31 +882,61 @@ class BuildEngine(
         val outputApk = File(env.outputDir, "app-unsigned.apk")
         val resourcesApk = File(env.outputDir, "resources.ap_")
         val dexFile = File(env.dexDir, "classes.dex")
+        val writtenEntries = mutableSetOf<String>()
 
-        ZipOutputStream(FileOutputStream(outputApk)).use { zos ->
-            // Copy everything from resources.ap_
-            if (resourcesApk.exists()) {
-                ZipInputStream(FileInputStream(resourcesApk)).use { zis ->
-                    var entry = zis.nextEntry
-                    while (entry != null) {
-                        try {
-                            zos.putNextEntry(ZipEntry(entry.name))
-                            zis.copyTo(zos)
-                            zos.closeEntry()
-                        } catch (e: Exception) { /* skip duplicates */ }
-                        zis.closeEntry()
-                        entry = zis.nextEntry
+        CountingOutputStream(FileOutputStream(outputApk)).use { cos ->
+            ZipOutputStream(cos).use { zos ->
+                // Copy everything from resources.ap_
+                if (resourcesApk.exists()) {
+                    ZipInputStream(FileInputStream(resourcesApk)).use { zis ->
+                        var entry = zis.nextEntry
+                        while (entry != null) {
+                            if (!entry.isDirectory && writtenEntries.add(entry.name)) {
+                                val bytes = zis.readBytes()
+                                val forceStoredAligned = entry.name == "resources.arsc"
+                                writeApkEntry(zos, cos, entry.name, bytes, forceStoredAligned)
+                            }
+                            zis.closeEntry()
+                            entry = zis.nextEntry
+                        }
                     }
                 }
-            }
-            // Add classes.dex
-            if (dexFile.exists()) {
-                zos.putNextEntry(ZipEntry("classes.dex"))
-                FileInputStream(dexFile).use { it.copyTo(zos) }
-                zos.closeEntry()
+
+                // Add classes.dex
+                if (dexFile.exists() && writtenEntries.add("classes.dex")) {
+                    writeApkEntry(zos, cos, "classes.dex", dexFile.readBytes(), forceStoredAligned = false)
+                }
             }
         }
         return outputApk.absolutePath
+    }
+
+    private fun writeApkEntry(
+        zos: ZipOutputStream,
+        cos: CountingOutputStream,
+        name: String,
+        bytes: ByteArray,
+        forceStoredAligned: Boolean
+    ) {
+        val entry = ZipEntry(name)
+        if (forceStoredAligned) {
+            val crc32 = CRC32().apply { update(bytes) }
+            entry.method = ZipEntry.STORED
+            entry.size = bytes.size.toLong()
+            entry.compressedSize = bytes.size.toLong()
+            entry.crc = crc32.value
+            // Android 11+ requires resources.arsc data offset to be 4-byte aligned.
+            val nameLen = name.toByteArray(Charsets.UTF_8).size
+            val dataOffsetWithoutExtra = cos.bytesWritten + 30L + nameLen
+            val padLen = ((4 - (dataOffsetWithoutExtra % 4)) % 4).toInt()
+            if (padLen > 0) {
+                entry.extra = ByteArray(padLen)
+            }
+        }
+
+        zos.putNextEntry(entry)
+        zos.write(bytes)
+        zos.closeEntry()
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -976,6 +1007,7 @@ class BuildEngine(
         com.android.apksig.ApkSigner.Builder(listOf(signerConfig))
             .setInputApk(unsignedApk)
             .setOutputApk(outputApk)
+            .setAlignFileSize(true)
             .setV1SigningEnabled(true)
             .setV2SigningEnabled(true)
             .setV3SigningEnabled(true)
@@ -1246,6 +1278,7 @@ class BuildEngine(
         if (!hasBinaryManifest(apkFile)) {
             return "Generated APK has an invalid AndroidManifest.xml (binary XML expected)."
         }
+        resourcesArscPackagingError(apkFile)?.let { return it }
 
         val packageInfo = packageArchiveInfoOrNull(apkPath)
         if (packageInfo == null) {
@@ -1257,6 +1290,104 @@ class BuildEngine(
             return "Generated APK is not installable (PackageManager could not parse it)."
         }
         return null
+    }
+
+    private fun resourcesArscPackagingError(apkFile: File): String? {
+        val info = findZipEntryInfo(apkFile, "resources.arsc")
+            ?: return "Generated APK is missing resources.arsc."
+
+        if (info.method != ZipEntry.STORED) {
+            return "Generated APK has compressed resources.arsc. " +
+                    "Android 11+ requires resources.arsc to be uncompressed."
+        }
+        if (info.dataOffset % 4L != 0L) {
+            return "Generated APK has unaligned resources.arsc. " +
+                    "Android 11+ requires resources.arsc to be aligned on a 4-byte boundary."
+        }
+        return null
+    }
+
+    private fun findZipEntryInfo(apkFile: File, targetName: String): ZipEntryInfo? {
+        RandomAccessFile(apkFile, "r").use { raf ->
+            val fileLength = raf.length()
+            val maxEocdSearch = 22 + 0xFFFF
+            val searchStart = maxOf(0L, fileLength - maxEocdSearch)
+            raf.seek(searchStart)
+            val searchBuf = ByteArray((fileLength - searchStart).toInt())
+            raf.readFully(searchBuf)
+
+            var eocdOffsetInBuf = -1
+            for (i in searchBuf.size - 22 downTo 0) {
+                if (searchBuf[i] == 0x50.toByte() &&
+                    searchBuf[i + 1] == 0x4B.toByte() &&
+                    searchBuf[i + 2] == 0x05.toByte() &&
+                    searchBuf[i + 3] == 0x06.toByte()
+                ) {
+                    eocdOffsetInBuf = i
+                    break
+                }
+            }
+            if (eocdOffsetInBuf < 0) return null
+
+            val eocdOffset = searchStart + eocdOffsetInBuf
+            raf.seek(eocdOffset + 10) // total entries
+            val totalEntries = readUInt16LE(raf)
+            raf.skipBytes(4) // central directory size
+            val centralDirOffset = readUInt32LE(raf)
+
+            raf.seek(centralDirOffset)
+            repeat(totalEntries) {
+                val sig = readUInt32LE(raf)
+                if (sig != 0x02014B50L) return null
+                raf.skipBytes(4) // version made by + version needed
+                val flags = readUInt16LE(raf)
+                val method = readUInt16LE(raf)
+                // last mod time/date (4) + crc32 (4) + compressed size (4) + uncompressed size (4)
+                raf.skipBytes(16)
+                val nameLen = readUInt16LE(raf)
+                val extraLen = readUInt16LE(raf)
+                val commentLen = readUInt16LE(raf)
+                raf.skipBytes(8) // disk number start + internal attr + external attr
+                val localHeaderOffset = readUInt32LE(raf)
+
+                val nameBytes = ByteArray(nameLen)
+                raf.readFully(nameBytes)
+                val charset = if ((flags and 0x800) != 0) Charsets.UTF_8 else Charsets.ISO_8859_1
+                val name = String(nameBytes, charset)
+
+                raf.skipBytes(extraLen + commentLen)
+
+                if (name == targetName) {
+                    raf.seek(localHeaderOffset)
+                    if (readUInt32LE(raf) != 0x04034B50L) return null
+                    raf.skipBytes(22)
+                    val localNameLen = readUInt16LE(raf)
+                    val localExtraLen = readUInt16LE(raf)
+                    val dataOffset = localHeaderOffset + 30L + localNameLen + localExtraLen
+                    return ZipEntryInfo(method = method, dataOffset = dataOffset)
+                }
+            }
+        }
+        return null
+    }
+
+    private fun readUInt16LE(raf: RandomAccessFile): Int {
+        val b0 = raf.read()
+        val b1 = raf.read()
+        if (b0 < 0 || b1 < 0) throw EOFException("Unexpected EOF while reading uint16")
+        return b0 or (b1 shl 8)
+    }
+
+    private fun readUInt32LE(raf: RandomAccessFile): Long {
+        val b0 = raf.read()
+        val b1 = raf.read()
+        val b2 = raf.read()
+        val b3 = raf.read()
+        if (b0 < 0 || b1 < 0 || b2 < 0 || b3 < 0) throw EOFException("Unexpected EOF while reading uint32")
+        return (b0.toLong() and 0xFF) or
+                ((b1.toLong() and 0xFF) shl 8) or
+                ((b2.toLong() and 0xFF) shl 16) or
+                ((b3.toLong() and 0xFF) shl 24)
     }
 
     private fun canParsePackageArchive(apkPath: String): Boolean {
@@ -1370,6 +1501,26 @@ data class BuildEnvironment(
     val androidJar: File,
     val buildDir: File
 )
+
+private data class ZipEntryInfo(
+    val method: Int,
+    val dataOffset: Long
+)
+
+private class CountingOutputStream(out: OutputStream) : FilterOutputStream(out) {
+    var bytesWritten: Long = 0
+        private set
+
+    override fun write(b: Int) {
+        out.write(b)
+        bytesWritten += 1
+    }
+
+    override fun write(b: ByteArray, off: Int, len: Int) {
+        out.write(b, off, len)
+        bytesWritten += len.toLong()
+    }
+}
 
 sealed class BuildEvent {
     data class Log(val message: String) : BuildEvent()

@@ -271,11 +271,18 @@ class ChatViewModel(
             repository.updateBuildStatus(projectId, BuildStatus.INSTALL_FAILED)
             _project.value = _project.value?.copy(buildStatus = BuildStatus.INSTALL_FAILED)
             val suffix = reason?.takeIf { it.isNotBlank() }?.let { "\nReason: $it" } ?: ""
-            val baseMessage = if (reason?.contains("INSTALL_PARSE_FAILED_NO_CERTIFICATES", ignoreCase = true) == true) {
-                "Installation failed due to invalid APK certificates. " +
-                        "Please update to the latest Forge build and run again."
-            } else {
-                "Installation failed. Go to Settings > Grant Install Permission, then tap Run again."
+            val baseMessage = when {
+                reason?.contains("INSTALL_PARSE_FAILED_NO_CERTIFICATES", ignoreCase = true) == true ->
+                    "Installation failed due to invalid APK certificates. " +
+                            "Please update to the latest Forge build and run again."
+                reason?.contains("INSTALL_FAILED_DEPRECATED_SDK_VERSION", ignoreCase = true) == true ->
+                    "Installation failed because the generated APK manifest has invalid SDK metadata. " +
+                            "Please update to the latest Forge build and run again."
+                reason?.contains("REQUEST_INSTALL_PACKAGES", ignoreCase = true) == true ||
+                        reason?.contains("UNKNOWN_SOURCES", ignoreCase = true) == true ->
+                    "Installation failed. Go to Settings > Grant Install Permission, then tap Run again."
+                else ->
+                    "Installation failed."
             }
             addErrorMessage(
                 "$baseMessage$suffix"
