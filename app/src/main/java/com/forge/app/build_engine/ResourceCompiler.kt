@@ -114,16 +114,14 @@ class ResourceCompiler(private val xmlEncoder: BinaryXmlEncoder = BinaryXmlEncod
             // AndroidManifest.xml → binary XML
             val manifestXml = manifestFile.readText()
             val binaryManifest = xmlEncoder.encode(manifestXml)
-            if (binaryManifest != null) {
-                zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
-                zos.write(binaryManifest)
-                zos.closeEntry()
-            } else {
-                // Fallback: include raw manifest
-                zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
-                zos.write(manifestFile.readBytes())
-                zos.closeEntry()
+            if (binaryManifest == null) {
+                throw IllegalStateException(
+                    "Binary manifest encoding failed. Check AndroidManifest.xml for unsupported XML patterns."
+                )
             }
+            zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
+            zos.write(binaryManifest)
+            zos.closeEntry()
 
             // resources.arsc
             zos.putNextEntry(ZipEntry("resources.arsc"))
@@ -223,7 +221,8 @@ class ResourceCompiler(private val xmlEncoder: BinaryXmlEncoder = BinaryXmlEncod
                     "dimen" -> addValueResource("dimen", TYPE_ID_DIMEN, element, resources, typeCounts)
                     "bool" -> addValueResource("bool", TYPE_ID_BOOL, element, resources, typeCounts)
                     "integer" -> addValueResource("integer", TYPE_ID_INTEGER, element, resources, typeCounts)
-                    "style" -> addValueResource("style", TYPE_ID_STYLE, element, resources, typeCounts)
+                    // Complex style bags are not supported by this simplified compiler.
+                    "style" -> { /* skip */ }
                     "declare-styleable", "attr" -> { /* skip for now */ }
                     "item" -> {
                         val type = element.getAttribute("type")
@@ -367,22 +366,25 @@ class ResourceCompiler(private val xmlEncoder: BinaryXmlEncoder = BinaryXmlEncod
             val entryCount = entries.maxOf { it.entryId } + 1
 
             // TypeSpec chunk (flags for each entry - 0 = no special config)
-            val specChunkSize = 8 + 4 + entryCount * 4
+            val specHeaderSize = 16
+            val specChunkSize = specHeaderSize + entryCount * 4
             val specBuf = ByteBuffer.allocate(specChunkSize).order(ByteOrder.LITTLE_ENDIAN)
             specBuf.putShort(RES_TABLE_TYPE_SPEC_TYPE)
-            specBuf.putShort(8.toShort()) // header size
+            specBuf.putShort(specHeaderSize.toShort()) // header size
             specBuf.putInt(specChunkSize)
             specBuf.put(typeId.toByte()) // id
             specBuf.put(0.toByte()) // res0
             specBuf.putShort(0.toShort()) // res1
+            specBuf.putInt(entryCount)
             repeat(entryCount) { specBuf.putInt(0) } // flags: default config
             packageChunkBody.write(specBuf.array())
 
             // Type chunk (actual entries with values)
             // Config size = 64 bytes (default config, all zeroes)
             val configSize = 64
-            val entryDataSize = calculateEntryDataSize(entries, entryCount)
-            val headerSize = 12 + configSize
+            val entryDataSize = calculateEntryDataSize(entries)
+            // 8-byte chunk header + 12-byte type header + config block.
+            val headerSize = 20 + configSize
             val offsetsSize = entryCount * 4
             val typeChunkSize = headerSize + offsetsSize + entryDataSize
 
@@ -478,7 +480,7 @@ class ResourceCompiler(private val xmlEncoder: BinaryXmlEncoder = BinaryXmlEncod
         return result.array()
     }
 
-    private fun calculateEntryDataSize(entries: List<ResourceEntry>, entryCount: Int): Int {
+    private fun calculateEntryDataSize(entries: List<ResourceEntry>): Int {
         return entries.size * 16 // each present entry = 8 (header) + 8 (value)
     }
 
@@ -568,16 +570,22 @@ class ResourceCompiler(private val xmlEncoder: BinaryXmlEncoder = BinaryXmlEncod
         }
 
         val headerSize = 28
-        val encodedStrings = strings.map { it.toByteArray(Charsets.UTF_8) }
+        data class EncodedString(val charLen: ByteArray, val byteLen: ByteArray, val bytes: ByteArray)
+        val encodedStrings = strings.map { text ->
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            EncodedString(
+                charLen = encodeLengthUtf8(text.length),
+                byteLen = encodeLengthUtf8(bytes.size),
+                bytes = bytes
+            )
+        }
 
         // Calculate offsets
         val offsets = mutableListOf<Int>()
         var currentOffset = 0
         encodedStrings.forEach { encoded ->
             offsets.add(currentOffset)
-            val charLen = encoded.toString(Charsets.UTF_8).length
-            // Each string: charLen (1 byte) + byteLen (1 byte) + data + null
-            currentOffset += 1 + 1 + encoded.size + 1
+            currentOffset += encoded.charLen.size + encoded.byteLen.size + encoded.bytes.size + 1
         }
 
         val stringsDataSize = currentOffset
@@ -601,10 +609,9 @@ class ResourceCompiler(private val xmlEncoder: BinaryXmlEncoder = BinaryXmlEncod
 
         // String data
         encodedStrings.forEach { encoded ->
-            val charLen = encoded.toString(Charsets.UTF_8).length
-            buf.put(charLen.toByte())
-            buf.put(encoded.size.toByte())
-            buf.put(encoded)
+            buf.put(encoded.charLen)
+            buf.put(encoded.byteLen)
+            buf.put(encoded.bytes)
             buf.put(0.toByte())
         }
 
@@ -612,5 +619,16 @@ class ResourceCompiler(private val xmlEncoder: BinaryXmlEncoder = BinaryXmlEncod
         while (buf.position() < totalSize) buf.put(0.toByte())
 
         return buf.array()
+    }
+
+    private fun encodeLengthUtf8(length: Int): ByteArray {
+        return if (length <= 0x7F) {
+            byteArrayOf(length.toByte())
+        } else {
+            byteArrayOf(
+                ((length shr 8) or 0x80).toByte(),
+                (length and 0xFF).toByte()
+            )
+        }
     }
 }

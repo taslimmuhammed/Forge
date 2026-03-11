@@ -2,6 +2,7 @@ package com.forge.app.build_engine
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.PackageInstaller
 import android.net.Uri
 import android.os.Build
@@ -29,6 +30,11 @@ import java.util.Date
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.transform.OutputKeys
+import javax.xml.transform.TransformerFactory
+import javax.xml.transform.dom.DOMSource
+import javax.xml.transform.stream.StreamResult
 
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
@@ -47,6 +53,9 @@ class BuildEngine(
     companion object {
         private const val TAG = "ForgeBuilder"
         private const val BUNDLED_ANDROID_JAR_ASSET = "android.jar"
+        private const val GENERATED_MIN_SDK = 26
+        private const val GENERATED_TARGET_SDK = 34
+        private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
         // Network fallback URLs if bundled tool extraction is not available.
         private val ANDROID_JAR_URLS = listOf(
             "https://raw.githubusercontent.com/nicksay/aosp-jars/main/android-26-api.jar",
@@ -155,6 +164,12 @@ class BuildEngine(
             send(BuildEvent.Log("✍️ Signing APK..."))
             val signedPath = signApk(apkPath)
             send(BuildEvent.Log("  ✓ APK signed"))
+
+            // Validate final APK before reporting success/installing.
+            validateInstallableApk(signedPath)?.let { validationError ->
+                send(BuildEvent.Error(validationError))
+                return
+            }
 
             val duration = System.currentTimeMillis() - startTime
             send(BuildEvent.Log("✅ Build successful in ${duration / 1000}s"))
@@ -736,36 +751,56 @@ class BuildEngine(
         val outputApk = File(env.outputDir, "resources.ap_")
         val genDir = File(env.buildDir, "gen").also { it.mkdirs() }
         val androidJarPath = env.androidJar.absolutePath
+        val failureLogs = mutableListOf<String>()
+
+        ensureManifestSdkLevels(manifestFile)?.let { return BuildResult(false, errorLog = it) }
 
         // aapt2 compile + link
         val compiledDir = File(env.resDir, "compiled").also { it.mkdirs() }
         val aapt2Result = tryAapt2("aapt2", resDir, manifestFile, compiledDir, outputApk, androidJarPath)
         if (aapt2Result.success) return aapt2Result
+        if (aapt2Result.errorLog.isNotBlank()) failureLogs.add(aapt2Result.errorLog)
 
         // Termux aapt2
         val termuxAapt2 = "/data/data/com.termux/files/usr/bin/aapt2"
         if (File(termuxAapt2).canExecute()) {
             val r = tryAapt2(termuxAapt2, resDir, manifestFile, compiledDir, outputApk, androidJarPath)
             if (r.success) return r
+            if (r.errorLog.isNotBlank()) failureLogs.add(r.errorLog)
         }
 
         // aapt v1
         val aaptResult = tryAapt("aapt", resDir, manifestFile, genDir, outputApk, androidJarPath)
         if (aaptResult.success) return aaptResult
+        if (aaptResult.errorLog.isNotBlank()) failureLogs.add(aaptResult.errorLog)
 
         // Termux aapt v1
         val termuxAapt = "/data/data/com.termux/files/usr/bin/aapt"
         if (File(termuxAapt).canExecute()) {
             val r = tryAapt(termuxAapt, resDir, manifestFile, genDir, outputApk, androidJarPath)
             if (r.success) return r
+            if (r.errorLog.isNotBlank()) failureLogs.add(r.errorLog)
         }
 
         // Pure-Java resource compiler (binary XML + resources.arsc, no native binary needed)
         val pureJavaResult = tryPureJavaResources(resDir, manifestFile, outputApk, packageName)
         if (pureJavaResult.success) return pureJavaResult
 
-        // Last resort: bundle files as plain zip (works for simple apps without resources)
-        return buildPlainResourcePackage(env, manifestFile, resDir, outputApk)
+        val toolDetails = failureLogs
+            .asSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .take(2)
+            .joinToString("\n\n")
+
+        return BuildResult(
+            false,
+            errorLog = "Resource packaging failed.\n\n" +
+                    "${pureJavaResult.errorLog.ifBlank { "Forge could not generate a valid binary AndroidManifest.xml." }}\n\n" +
+                    (if (toolDetails.isNotBlank()) "Native tool errors:\n$toolDetails\n\n" else "") +
+                    "Install Termux and run:\n  pkg install aapt aapt2\n\nThen tap Run again."
+        )
     }
 
     /**
@@ -774,17 +809,29 @@ class BuildEngine(
      */
     private fun tryPureJavaResources(resDir: File, manifestFile: File, outputApk: File, packageName: String): BuildResult {
         return try {
+            firstInvalidXmlError(manifestFile, resDir)?.let { return BuildResult(false, errorLog = it) }
+
             val resourceCompiler = ResourceCompiler()
             resourceCompiler.compile(resDir, manifestFile, outputApk, packageName)
-            if (outputApk.exists() && outputApk.length() > 0) {
+            if (outputApk.exists() && outputApk.length() > 0 && hasBinaryManifest(outputApk)) {
                 Log.d(TAG, "Pure-Java resource compilation successful: ${outputApk.length()} bytes")
                 BuildResult(true)
             } else {
-                BuildResult(false, errorLog = "Pure-Java resource compiler produced no output")
+                BuildResult(
+                    false,
+                    errorLog = "Forge could not generate a valid binary AndroidManifest.xml from this project."
+                )
             }
         } catch (e: Exception) {
             Log.w(TAG, "Pure-Java resource compilation failed: ${e.message}", e)
-            BuildResult(false, errorLog = "Resource compiler error: ${e.message}")
+            val root = generateSequence<Throwable>(e) { it.cause }.last()
+            val details = root.message?.takeIf { it.isNotBlank() }
+                ?: e.message?.takeIf { it.isNotBlank() }
+                ?: root.javaClass.simpleName
+            BuildResult(
+                false,
+                errorLog = "Resource compiler error (${root.javaClass.simpleName}): $details"
+            )
         }
     }
 
@@ -823,31 +870,6 @@ class BuildEngine(
             else BuildResult(false, errorLog = "aapt: ${result.errorLog}")
         } catch (e: Exception) {
             BuildResult(false, errorLog = "aapt: ${e.message}")
-        }
-    }
-
-    private fun buildPlainResourcePackage(
-        env: BuildEnvironment, manifestFile: File, resDir: File, outputApk: File
-    ): BuildResult {
-        return try {
-            ZipOutputStream(FileOutputStream(outputApk)).use { zos ->
-                // AndroidManifest.xml
-                zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
-                manifestFile.inputStream().use { it.copyTo(zos) }
-                zos.closeEntry()
-                // res/ files
-                if (resDir.exists()) {
-                    resDir.walkTopDown().filter { it.isFile }.forEach { f ->
-                        zos.putNextEntry(ZipEntry("res/" + f.relativeTo(resDir).path))
-                        f.inputStream().use { it.copyTo(zos) }
-                        zos.closeEntry()
-                    }
-                }
-            }
-            BuildResult(true)
-        } catch (e: Exception) {
-            BuildResult(false, errorLog = "Resource packaging failed: ${e.message}\n\n" +
-                    "Install Termux from F-Droid then run:\n  pkg install aapt\n\nThen tap Run again.")
         }
     }
 
@@ -893,14 +915,29 @@ class BuildEngine(
     private fun signApk(unsignedApkPath: String): String {
         val unsignedApk = File(unsignedApkPath)
         val signedApk = File(unsignedApk.parent, "app-debug.apk")
+        val (privateKey, cert) = getOrCreateDebugKey()
 
-        // Try pure-Java in-process signing
+        // Primary: apksig (platform-consistent signing blocks)
         try {
-            val (privateKey, cert) = getOrCreateDebugKey()
-            ApkSigner(privateKey, cert).sign(unsignedApk, signedApk)
-            return signedApk.absolutePath
+            if (tryApkSigSign(unsignedApk, signedApk, privateKey, cert) &&
+                canParsePackageArchive(signedApk.absolutePath)
+            ) {
+                return signedApk.absolutePath
+            }
+            Log.w(TAG, "apksig produced an unparseable APK; trying fallback signers")
         } catch (e: Exception) {
-            Log.w(TAG, "In-process signing failed: ${e.message}")
+            Log.w(TAG, "apksig signing failed: ${e.message}")
+        }
+
+        // Secondary: legacy in-process signer
+        try {
+            ApkSigner(privateKey, cert).sign(unsignedApk, signedApk)
+            if (canParsePackageArchive(signedApk.absolutePath)) {
+                return signedApk.absolutePath
+            }
+            Log.w(TAG, "Legacy in-process signed APK is not parseable; trying apksigner fallback")
+        } catch (e: Exception) {
+            Log.w(TAG, "Legacy in-process signing failed: ${e.message}")
         }
 
         // Fallback: shell apksigner
@@ -913,13 +950,40 @@ class BuildEngine(
                     "--ks-pass", "pass:forge123",
                     "--out", signedApk.absolutePath,
                     unsignedApkPath))
-                if (r.success) return signedApk.absolutePath
+                if (r.success && canParsePackageArchive(signedApk.absolutePath)) {
+                    return signedApk.absolutePath
+                }
             } catch (e: Exception) { continue }
         }
 
         // Last resort: copy unsigned
         unsignedApk.copyTo(signedApk, overwrite = true)
         return signedApk.absolutePath
+    }
+
+    private fun tryApkSigSign(
+        unsignedApk: File,
+        outputApk: File,
+        privateKey: java.security.PrivateKey,
+        cert: java.security.cert.X509Certificate
+    ): Boolean {
+        val signerConfig = com.android.apksig.ApkSigner.SignerConfig.Builder(
+            "forge_debug",
+            privateKey,
+            listOf(cert)
+        ).build()
+
+        com.android.apksig.ApkSigner.Builder(listOf(signerConfig))
+            .setInputApk(unsignedApk)
+            .setOutputApk(outputApk)
+            .setV1SigningEnabled(true)
+            .setV2SigningEnabled(true)
+            .setV3SigningEnabled(true)
+            .setV4SigningEnabled(false)
+            .build()
+            .sign()
+
+        return outputApk.exists() && outputApk.length() > 0
     }
 
     private fun getOrCreateDebugKey(): Pair<java.security.PrivateKey, java.security.cert.X509Certificate> {
@@ -955,12 +1019,25 @@ class BuildEngine(
         val certBuilder = JcaX509v3CertificateBuilder(
             issuer, serial, notBefore, notAfter, issuer, keyPair.public
         )
-        val signer = JcaContentSignerBuilder("SHA256withRSA")
-            .setProvider("BC")
-            .build(keyPair.private)
-        val cert = JcaX509CertificateConverter()
-            .setProvider("BC")
-            .getCertificate(certBuilder.build(signer))
+        val signer = try {
+            JcaContentSignerBuilder("SHA256withRSA")
+                .setProvider("BC")
+                .build(keyPair.private)
+        } catch (e: Exception) {
+            Log.w(TAG, "BC signer unavailable, falling back to default provider: ${e.message}")
+            JcaContentSignerBuilder("SHA256withRSA")
+                .build(keyPair.private)
+        }
+
+        val certHolder = certBuilder.build(signer)
+        val cert = try {
+            JcaX509CertificateConverter()
+                .setProvider("BC")
+                .getCertificate(certHolder)
+        } catch (e: Exception) {
+            Log.w(TAG, "BC certificate converter unavailable, using default provider: ${e.message}")
+            JcaX509CertificateConverter().getCertificate(certHolder)
+        }
 
         // Save to PKCS12 keystore
         val ks = KeyStore.getInstance("PKCS12")
@@ -996,13 +1073,17 @@ class BuildEngine(
                 FileInputStream(apkFile).use { it.copyTo(out) }
                 session.fsync(out)
             }
-            val intent = Intent(context, PackageInstallReceiver::class.java)
+            val intent = Intent(PackageInstallReceiver.INSTALL_RESULT_ACTION).apply {
+                setClass(context, PackageInstallReceiver::class.java)
+                setPackage(context.packageName)
+            }
             val pi = android.app.PendingIntent.getBroadcast(
                 context, sessionId, intent,
                 android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_MUTABLE
             )
             session.commit(pi.intentSender)
             session.close()
+            Log.d(TAG, "Install session committed: id=$sessionId, apk=${apkFile.absolutePath}")
         } catch (e: Exception) {
             Log.e(TAG, "PackageInstaller failed", e)
             installWithIntent(context, apkFile, onComplete)
@@ -1042,6 +1123,152 @@ class BuildEngine(
             else BuildResult(false, errorLog = out)
         } catch (e: Exception) {
             BuildResult(false, errorLog = "${cmd.firstOrNull()}: ${e.message}")
+        }
+    }
+
+    private fun firstInvalidXmlError(manifestFile: File, resDir: File): String? {
+        val xmlFiles = mutableListOf<File>()
+        if (manifestFile.exists()) xmlFiles.add(manifestFile)
+        if (resDir.exists()) {
+            resDir.walkTopDown()
+                .filter { it.isFile && it.extension.equals("xml", ignoreCase = true) }
+                .forEach { xmlFiles.add(it) }
+        }
+
+        val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
+        for (file in xmlFiles.distinct()) {
+            try {
+                factory.newDocumentBuilder().parse(file)
+            } catch (e: Exception) {
+                val relativePath = runCatching {
+                    file.relativeTo(fileManager.getProjectRoot()).path
+                }.getOrElse { file.absolutePath }
+                val reason = e.message ?: "parse error"
+                return "Invalid XML in $relativePath: $reason\n" +
+                        "Tip: escape special characters such as &, <, >, and quotes in XML values."
+            }
+        }
+        return null
+    }
+
+    private fun ensureManifestSdkLevels(manifestFile: File): String? {
+        if (!manifestFile.exists()) {
+            return "AndroidManifest.xml not found at ${manifestFile.absolutePath}"
+        }
+        return try {
+            val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
+            val doc = factory.newDocumentBuilder().parse(manifestFile)
+            val manifest = doc.documentElement ?: return "Invalid AndroidManifest.xml: missing <manifest> root."
+            if (manifest.tagName != "manifest") {
+                return "Invalid AndroidManifest.xml: root element must be <manifest>."
+            }
+
+            if (!manifest.hasAttribute("xmlns:android")) {
+                manifest.setAttribute("xmlns:android", ANDROID_NS)
+            }
+
+            var usesSdk: org.w3c.dom.Element? = null
+            val children = manifest.childNodes
+            for (i in 0 until children.length) {
+                val node = children.item(i)
+                if (node.nodeType == org.w3c.dom.Node.ELEMENT_NODE &&
+                    (node as org.w3c.dom.Element).tagName == "uses-sdk"
+                ) {
+                    usesSdk = node
+                    break
+                }
+            }
+
+            if (usesSdk == null) {
+                usesSdk = doc.createElement("uses-sdk")
+                var inserted = false
+                for (i in 0 until children.length) {
+                    val node = children.item(i)
+                    if (node.nodeType == org.w3c.dom.Node.ELEMENT_NODE &&
+                        (node as org.w3c.dom.Element).tagName == "application"
+                    ) {
+                        manifest.insertBefore(usesSdk, node)
+                        inserted = true
+                        break
+                    }
+                }
+                if (!inserted) {
+                    manifest.appendChild(usesSdk)
+                }
+            }
+
+            val existingMin = usesSdk.getAttributeNS(ANDROID_NS, "minSdkVersion").toIntOrNull()
+            val existingTarget = usesSdk.getAttributeNS(ANDROID_NS, "targetSdkVersion").toIntOrNull()
+            val minSdk = maxOf(existingMin ?: GENERATED_MIN_SDK, GENERATED_MIN_SDK)
+            val targetSdk = maxOf(existingTarget ?: GENERATED_TARGET_SDK, GENERATED_TARGET_SDK)
+            usesSdk.setAttributeNS(ANDROID_NS, "android:minSdkVersion", minSdk.toString())
+            usesSdk.setAttributeNS(ANDROID_NS, "android:targetSdkVersion", targetSdk.toString())
+
+            val transformer = TransformerFactory.newInstance().newTransformer().apply {
+                setOutputProperty(OutputKeys.INDENT, "yes")
+                setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "no")
+            }
+            transformer.transform(DOMSource(doc), StreamResult(manifestFile))
+            null
+        } catch (e: Exception) {
+            "Could not update manifest SDK levels: ${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
+    private fun hasBinaryManifest(apkFile: File): Boolean {
+        return try {
+            ZipInputStream(FileInputStream(apkFile)).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (entry.name == "AndroidManifest.xml") {
+                        val header = ByteArray(4)
+                        val read = zis.read(header)
+                        return read == 4 &&
+                                header[0] == 0x03.toByte() &&
+                                header[1] == 0x00.toByte() &&
+                                header[2] == 0x08.toByte() &&
+                                header[3] == 0x00.toByte()
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "Manifest validation failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun validateInstallableApk(apkPath: String): String? {
+        val apkFile = File(apkPath)
+        if (!apkFile.exists()) return "Generated APK not found at $apkPath"
+        if (!hasBinaryManifest(apkFile)) {
+            return "Generated APK has an invalid AndroidManifest.xml (binary XML expected)."
+        }
+
+        val packageInfo = packageArchiveInfoOrNull(apkPath)
+        if (packageInfo == null) {
+            val unsignedCandidate = File(apkFile.parentFile, "app-unsigned.apk")
+            if (unsignedCandidate.exists() && packageArchiveInfoOrNull(unsignedCandidate.absolutePath) != null) {
+                return "Generated APK became unparseable after signing. " +
+                        "The resource package is valid, but signing output was rejected by PackageManager."
+            }
+            return "Generated APK is not installable (PackageManager could not parse it)."
+        }
+        return null
+    }
+
+    private fun canParsePackageArchive(apkPath: String): Boolean {
+        return packageArchiveInfoOrNull(apkPath) != null
+    }
+
+    private fun packageArchiveInfoOrNull(apkPath: String): android.content.pm.PackageInfo? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.packageManager.getPackageArchiveInfo(apkPath, PackageManager.PackageInfoFlags.of(0))
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageArchiveInfo(apkPath, 0)
         }
     }
 

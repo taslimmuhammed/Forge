@@ -105,27 +105,50 @@ class ProjectFileManager(
             }
         }
 
+        // Repair XML boilerplate for projects created with unescaped names (e.g. "&", quotes).
+        val safeProjectName = escapeXml(project.name)
+        if (safeProjectName != project.name) {
+            listOf(
+                "app/src/main/AndroidManifest.xml",
+                "app/src/main/res/layout/activity_main.xml",
+                "app/src/main/res/values/strings.xml"
+            ).forEach { path ->
+                readFile(path)?.let { content ->
+                    val updated = content.replace(project.name, safeProjectName)
+                    if (updated != content) {
+                        writeFile(path, updated)
+                        changed = true
+                    }
+                }
+            }
+        }
+
         if (changed) updateFileHashes()
         return changed
     }
 
     private fun writeBoilerplate() {
+        val safeProjectName = escapeXml(project.name)
+
         // AndroidManifest.xml
         writeFile("app/src/main/AndroidManifest.xml", """
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="${project.packageName}">
+    <uses-sdk
+        android:minSdkVersion="26"
+        android:targetSdkVersion="34" />
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
-        android:label="${project.name}"
+        android:label="$safeProjectName"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="${project.name}">
+            android:label="$safeProjectName">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
@@ -166,7 +189,7 @@ public class MainActivity extends Activity {
         android:id="@+id/tvAppName"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="${project.name}"
+        android:text="$safeProjectName"
         android:textSize="28sp"
         android:textStyle="bold"
         android:textColor="#1A1A2E"
@@ -187,7 +210,7 @@ public class MainActivity extends Activity {
         // strings.xml
         writeFile("app/src/main/res/values/strings.xml", """
 <resources>
-    <string name="app_name">${project.name}</string>
+    <string name="app_name">$safeProjectName</string>
 </resources>
         """.trimIndent())
 
@@ -333,6 +356,21 @@ dependencies {
     private fun sha256(input: String): String {
         val bytes = MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
         return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun escapeXml(input: String): String {
+        val output = StringBuilder(input.length)
+        input.forEach { ch ->
+            when (ch) {
+                '&' -> output.append("&amp;")
+                '<' -> output.append("&lt;")
+                '>' -> output.append("&gt;")
+                '"' -> output.append("&quot;")
+                '\'' -> output.append("&apos;")
+                else -> output.append(ch)
+            }
+        }
+        return output.toString()
     }
 
     fun getProjectRoot(): File = projectRoot

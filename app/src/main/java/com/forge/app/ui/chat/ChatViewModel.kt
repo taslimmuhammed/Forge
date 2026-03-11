@@ -66,23 +66,22 @@ class ChatViewModel(
             agent = ForgeAgent(getApplication(), fileManager!!, proj)
             buildEngine = BuildEngine(getApplication(), fileManager!!)
             chatHistoryManager = ChatHistoryManager(getApplication(), projectId)
-            val migratedLegacyBoilerplate = fileManager!!.migrateLegacyBoilerplateIfNeeded()
+            val repairedBoilerplate = fileManager!!.migrateLegacyBoilerplateIfNeeded()
 
             // Load persisted chat history
             val history = chatHistoryManager!!.loadMessages(projectId)
             if (history.isNotEmpty()) {
                 _messages.value = history
-                if (migratedLegacyBoilerplate) {
+                if (repairedBoilerplate) {
                     addSystemMessage(
-                        "Updated legacy AppCompat boilerplate to offline-friendly Activity template. " +
-                                "Tap Run again."
+                        "Updated project boilerplate for offline build compatibility. Tap Run again."
                     )
                 }
             } else {
                 addSystemMessage("Project loaded: **${proj.name}**\n\nTap ▶ Run to build and install the boilerplate app, or describe what you want to build!")
-                if (migratedLegacyBoilerplate) {
+                if (repairedBoilerplate) {
                     addSystemMessage(
-                        "Legacy AppCompat boilerplate was migrated to offline-friendly Activity template."
+                        "Project boilerplate was repaired for offline build compatibility."
                     )
                 }
             }
@@ -155,8 +154,7 @@ class ChatViewModel(
                             engine.installApk(getApplication(), apkPath) { success ->
                                 viewModelScope.launch {
                                     if (!success) {
-                                        addErrorMessage("Installation failed. Ensure 'Install Unknown Apps' is granted in Settings.")
-                                        repository.updateBuildStatus(projectId, BuildStatus.INSTALL_FAILED)
+                                        onInstallFailed("Could not start package install session.")
                                     }
                                 }
                             }
@@ -268,11 +266,20 @@ class ChatViewModel(
         }
     }
 
-    fun onInstallFailed() {
+    fun onInstallFailed(reason: String? = null) {
         viewModelScope.launch {
             repository.updateBuildStatus(projectId, BuildStatus.INSTALL_FAILED)
             _project.value = _project.value?.copy(buildStatus = BuildStatus.INSTALL_FAILED)
-            addErrorMessage("Installation failed. Go to Settings > Grant Install Permission, then tap Run again.")
+            val suffix = reason?.takeIf { it.isNotBlank() }?.let { "\nReason: $it" } ?: ""
+            val baseMessage = if (reason?.contains("INSTALL_PARSE_FAILED_NO_CERTIFICATES", ignoreCase = true) == true) {
+                "Installation failed due to invalid APK certificates. " +
+                        "Please update to the latest Forge build and run again."
+            } else {
+                "Installation failed. Go to Settings > Grant Install Permission, then tap Run again."
+            }
+            addErrorMessage(
+                "$baseMessage$suffix"
+            )
             _uiState.value = ChatUiState.Idle
         }
     }

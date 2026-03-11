@@ -253,19 +253,26 @@ class BinaryXmlEncoder {
     private fun buildStringPool(strings: List<String>): ByteArray {
         val stringCount = strings.size
 
-        // Encode strings as UTF-8
-        val encodedStrings = strings.map { it.toByteArray(Charsets.UTF_8) }
+        data class EncodedString(val charLen: ByteArray, val byteLen: ByteArray, val bytes: ByteArray)
+        val encodedStrings = strings.map { text ->
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            EncodedString(
+                charLen = encodeLengthUtf8(text.length),
+                byteLen = encodeLengthUtf8(bytes.size),
+                bytes = bytes
+            )
+        }
+
+        // Compute per-string offsets based on the exact bytes that will be written.
         val offsets = mutableListOf<Int>()
         var currentOffset = 0
         encodedStrings.forEach { encoded ->
             offsets.add(currentOffset)
-            // UTF-8 string format: 2-byte char length + 2-byte byte length + bytes + null
-            currentOffset += 2 + 2 + encoded.size + 1
+            currentOffset += encoded.charLen.size + encoded.byteLen.size + encoded.bytes.size + 1
         }
-        val stringsDataSize = currentOffset
 
-        // Pad to 4-byte alignment
-        val paddedStringsDataSize = (stringsDataSize + 3) and 3.inv()
+        val stringsDataSize = currentOffset
+        val paddedStringsDataSize = (stringsDataSize + 3) and 3.inv() // 4-byte alignment
 
         val headerSize = 28
         val totalSize = headerSize + (4 * stringCount) + paddedStringsDataSize
@@ -285,22 +292,9 @@ class BinaryXmlEncoder {
 
         // String data
         encodedStrings.forEach { encoded ->
-            val charLen = encoded.toString(Charsets.UTF_8).length
-            // UTF-8 format: char count (1 or 2 bytes) + byte count (1 or 2 bytes) + data + null
-            if (charLen > 127) {
-                buf.put(((charLen shr 8) or 0x80).toByte())
-                buf.put((charLen and 0xFF).toByte())
-            } else {
-                buf.put(charLen.toByte())
-                buf.put(0.toByte()) // padding for short strings? Actually: 1 byte charLen, 1 byte byteLen
-            }
-            // Rewrite: simpler UTF-8 encoding
-            // Actually the format is: charLen (1-2 bytes), byteLen (1-2 bytes), data, 0x00
-            // For simplicity with small strings:
-            buf.position(buf.position() - 2) // back up
-            buf.put(charLen.toByte()) // char length
-            buf.put(encoded.size.toByte()) // byte length
-            buf.put(encoded)
+            buf.put(encoded.charLen)
+            buf.put(encoded.byteLen)
+            buf.put(encoded.bytes)
             buf.put(0.toByte()) // null terminator
         }
 
@@ -308,6 +302,17 @@ class BinaryXmlEncoder {
         while (buf.position() < totalSize) buf.put(0.toByte())
 
         return buf.array()
+    }
+
+    private fun encodeLengthUtf8(length: Int): ByteArray {
+        return if (length <= 0x7F) {
+            byteArrayOf(length.toByte())
+        } else {
+            byteArrayOf(
+                ((length shr 8) or 0x80).toByte(),
+                (length and 0xFF).toByte()
+            )
+        }
     }
 
     private fun buildResourceIdMap(strings: List<String>, outIds: MutableList<Int>): ByteArray {

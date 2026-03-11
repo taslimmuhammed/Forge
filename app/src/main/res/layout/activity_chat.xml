@@ -5,12 +5,14 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
+    android:fitsSystemWindows="true"
     android:background="#0F0F1A">
 
     <!-- Toolbar -->
     <com.google.android.material.appbar.AppBarLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:fitsSystemWindows="true"
         android:background="#161625"
         app:elevation="4dp">
 
@@ -46,22 +48,32 @@
                     android:textColor="#7B7B9A"/>
             </LinearLayout>
 
-            <!-- Run Button -->
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnRun"
-                android:layout_width="wrap_content"
-                android:layout_height="36dp"
-                android:text="▶ Run"
-                android:textSize="13sp"
-                android:textColor="#FFFFFF"
-                app:backgroundTint="#22C55E"
-                app:cornerRadius="8dp"
-                android:paddingStart="16dp"
-                android:paddingEnd="16dp"
-                android:layout_marginEnd="8dp"/>
-
         </androidx.appcompat.widget.Toolbar>
     </com.google.android.material.appbar.AppBarLayout>
+
+    <!-- Run row moved below toolbar to avoid notch overlap -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#161625"
+        android:gravity="end"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:paddingTop="6dp"
+        android:paddingBottom="8dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnRun"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:text="▶ Run"
+            android:textSize="13sp"
+            android:textColor="#FFFFFF"
+            app:backgroundTint="#22C55E"
+            app:cornerRadius="8dp"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp" />
+    </LinearLayout>
 
     <!-- Status bar -->
     <TextView

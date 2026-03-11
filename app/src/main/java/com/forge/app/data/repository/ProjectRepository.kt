@@ -19,12 +19,14 @@ class ProjectRepository(private val context: Context) {
     val allProjects: Flow<List<ForgeProject>> = dao.getAllProjects()
 
     suspend fun createProject(name: String, domain: String, appName: String): ForgeProject {
-        val packageName = "${domain.lowercase()}.${appName.lowercase()}"
+        val safeDomain = sanitizeDomain(domain)
+        val safeAppName = sanitizePackageSegment(appName, fallback = "app")
+        val packageName = "$safeDomain.$safeAppName"
         val project = ForgeProject(
             name = name,
             packageName = packageName,
-            domain = domain.lowercase(),
-            appName = appName.lowercase()
+            domain = safeDomain,
+            appName = safeAppName
         )
         // Create directory structure
         ProjectFileManager(context, project).initializeProjectStructure()
@@ -53,5 +55,26 @@ class ProjectRepository(private val context: Context) {
             System.currentTimeMillis(),
             if (success) BuildStatus.BUILD_SUCCESS else BuildStatus.BUILD_FAILED
         )
+    }
+
+    private fun sanitizeDomain(raw: String): String {
+        val parts = raw.split(".")
+            .map { sanitizePackageSegment(it, fallback = "app") }
+            .filter { it.isNotEmpty() }
+
+        return when {
+            parts.size >= 2 -> parts.joinToString(".")
+            parts.size == 1 -> "com.${parts.first()}"
+            else -> "com.example"
+        }
+    }
+
+    private fun sanitizePackageSegment(raw: String, fallback: String): String {
+        val cleaned = raw.lowercase()
+            .replace(Regex("[^a-z0-9_]"), "")
+            .trim('_')
+
+        val segment = if (cleaned.isBlank()) fallback else cleaned
+        return if (segment.first().isLetter()) segment else "app$segment"
     }
 }

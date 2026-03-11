@@ -62,12 +62,7 @@
 
         <receiver
             android:name=".build_engine.PackageInstallReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="android.intent.action.PACKAGE_ADDED" />
-                <data android:scheme="package" />
-            </intent-filter>
-        </receiver>
+            android:exported="false" />
 
     </application>
 

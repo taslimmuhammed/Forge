@@ -11,6 +11,47 @@ Forge is an on-device Android IDE app powered by Claude Opus 4.6. It lets users 
 
 ---
 
+## Latest Session Update (March 10, 2026)
+
+This session focused on build reliability and install correctness:
+
+1. **Build tools are now offline-first**
+   - `android.jar` is bundled at `app/src/main/assets/android.jar`.
+   - BuildEngine extracts bundled stubs first; network download is only fallback.
+
+2. **ECJ error reporting fixed**
+   - Real ECJ compile diagnostics are shown directly.
+   - The old misleading `"No Java compiler found"` masking normal compile errors was removed.
+
+3. **Full build error visibility added**
+   - Chat no longer truncates build error text.
+   - Full build log modal added in chat with Copy action.
+   - Full logs are chunked to Logcat with tag `ForgeBuildLog`.
+
+4. **Install callback flow fixed**
+   - PackageInstaller callback now handles `STATUS_PENDING_USER_ACTION`.
+   - Receiver launches install confirmation intent when required.
+   - Install status + status message are propagated back to Chat UI.
+
+5. **Invalid APK false-success blocked**
+   - Build pipeline now validates final APK before success:
+     - binary manifest header check,
+     - `PackageManager.getPackageArchiveInfo()` parse check.
+   - If invalid, build fails early with explicit error.
+
+6. **Resource fallback tightened**
+   - Removed plain-zip resource fallback that could produce invalid installable APKs.
+   - If valid resource packaging is unavailable, build now fails clearly and suggests `aapt/aapt2`.
+
+7. **Generated project boilerplate made offline-safe**
+   - New projects use `android.app.Activity` by default (no AppCompat dependency required).
+   - Legacy boilerplate projects auto-migrate on load from `AppCompatActivity` to `Activity`.
+
+8. **Chat Run button notch fix**
+   - Run button moved out of toolbar to a dedicated right-aligned row under the app bar.
+
+---
+
 ## Current State — What Is Built and Working
 
 ### ✅ Fully implemented
@@ -21,13 +62,15 @@ Forge is an on-device Android IDE app powered by Claude Opus 4.6. It lets users 
 - **Token optimization** — File hashing (only changed files sent), conversation summarization after 8 turns, max 10 turns per API call, keyword-based file relevance scoring
 - **On-device build pipeline** (`BuildEngine.kt`) — Full Java → DEX → APK → Sign → Install pipeline with multi-tier fallbacks at each stage
 - **Boilerplate generation** — Blank Android app generated on project creation (no API key needed)
+- **Offline build stubs** — `android.jar` bundled in app assets, extracted on-device
 - **Auto error repair** — Build errors automatically fed back to Claude to fix (only triggers when API key is set and it's a code error, not a tooling error)
-- **APK installation** — PackageInstaller API (Android 8+) with intent fallback
+- **APK installation** — PackageInstaller API with user-action callback handling and reason propagation
 - **APK export/share** — Share built APK via Android share sheet
 - **Settings screen** — API key management, install permission grant, Termux setup guide
 - **BuildService** — Foreground service keeps process alive during long builds
 - **Version bumping** — versionCode auto-incremented before each build so reinstall works
 - **Chat history persistence** — Messages saved to JSON per project, survive app restarts
+- **Full build log UX** — Full error in chat, full-log dialog, copy support, Logcat chunk logging
 - **Rename project** — Full rename flow with dialog
 - **Permission helper** — REQUEST_INSTALL_PACKAGES runtime permission handling
 
@@ -78,20 +121,22 @@ agent/
 build_engine/
 ├── BuildEngine.kt            ← Full on-device build pipeline
 │                                channelFlow + withContext(IO) + ProducerScope extension
-│                                Step 1: Download android.jar (first run only, cached)
+│                                Step 1: Extract bundled android.jar (offline-first), download fallback
 │                                Step 2: Prepare build dirs
 │                                Step 3: Resolve + download dependencies
 │                                Step 4: Compile Java via ECJ (bundled Gradle dependency) → javac fallback
-│                                Step 5: DEX via dx.jar reflection → dx shell → Termux dx
-│                                Step 6: Resources via aapt2 → aapt → Termux aapt → plain zip
+│                                Step 5: DEX via D8 (primary) → dx.jar reflection → dx shell → Termux dx
+│                                Step 6: Resources via aapt2 → aapt → Termux aapt → pure-Java compiler
 │                                Step 7: Assemble APK (merge resources.ap_ + classes.dex)
 │                                Step 8: Sign via Android Keystore (pure Java) → apksigner shell
+│                                Step 9: Validate APK parseability before install/success
 │                                Emits: BuildEvent.Log / BuildEvent.Success / BuildEvent.Error
 ├── BuildService.kt           ← Foreground service, keeps process alive during builds
 │                                Shows notification with cancel action
 │                                Exposes BuildService.startBuild() / cancelBuild()
 ├── PackageInstallReceiver.kt ← BroadcastReceiver for PackageInstaller session results
-│                                Broadcasts INSTALL_RESULT_ACTION with success/packageName
+│                                Handles pending-user-action confirmation flow
+│                                Broadcasts INSTALL_RESULT_ACTION with status/statusMessage
 └── VersionManager.kt         ← Reads/writes .forge/version_code.txt
                                  bumpVersionInBuildGradle() patches generated app's build.gradle
 
@@ -109,7 +154,8 @@ data/
     ├── ProjectFileManager.kt ← All file I/O for generated projects
     │                            getProjectRoot(), readFile(), writeFile()
     │                            readForgeMd() / writeForgeMd()
-    │                            writeBoilerplate() — generates blank Android app on create
+    │                            writeBoilerplate() — generates offline-friendly Activity-based app
+    │                            migrateLegacyBoilerplateIfNeeded() for old AppCompat templates
     │                            srcMainDir property used by BuildEngine
     └── ProjectRepository.kt  ← Room-backed CRUD for ForgeProject
                                  updateBuildStatus(), markBuilt(), deleteProject()
@@ -122,10 +168,13 @@ ui/
 │   │                            without an API key set
 │   ├── ChatActivity.kt       ← Chat screen: toolbar, RecyclerView, send button, Run button
 │   │                            Registers install BroadcastReceiver
+│   │                            Run button moved to right-aligned row below app bar (notch-safe)
+│   │                            Tap build log sheet to open full log dialog
 │   │                            Overflow menu: Export APK, Clear Chat, Settings
 │   ├── ChatViewModel.kt      ← Orchestrates agent + build + install
 │   │                            sendMessage() → ForgeAgent → applies ops → addAssistantMessage
 │   │                            buildAndRun() → VersionManager → BuildService → BuildEngine
+│   │                            Logs full build errors to Logcat tag ForgeBuildLog
 │   │                            autoRepairBuildError() — only when API key set + code error
 │   │                            clearChatHistory(), addSystemMessagePublic()
 │   └── MessageAdapter.kt     ← RecyclerView adapter for 3 view types: user/assistant/system
@@ -340,11 +389,12 @@ android:name=".ForgeApplication"          <!-- App class -->
 
 1. User creates first project → `ProjectFileManager.writeBoilerplate()` generates blank app
 2. User taps Run → `BuildEngine` starts
-3. First run: downloads android.jar (~16MB) to `/files/forge_tools/` — takes 10–30s on good WiFi
-4. Subsequent runs: android.jar already cached, build starts immediately
+3. First run: extracts bundled `android.jar` from app assets to `/files/forge_tools/android.jar` (no internet required)
+4. If bundled asset is unavailable/corrupt: network mirror download fallback is attempted
 5. If ECJ fails: detailed error shown with the actual compiler error
 6. User enters API key on first chat message → stored in Android Keystore
 7. Agent called → forge.md created/updated per project
+8. Before marking build success, final APK is parse-validated to avoid false-success install failures
 
 ---
 
@@ -354,8 +404,8 @@ android:name=".ForgeApplication"          <!-- App class -->
 |---|---|---|
 | No Kotlin source support | High | ECJ only compiles Java. Kotlin needs `kotlinc` bundled or downloaded |
 | DEX step may fail on some devices | High | `dx.jar` not present on all AOSP builds; Termux dx is the reliable fallback |
-| AAPT2/AAPT not available on stock Android | High | Not bundled in user-facing Android. Plain zip fallback is a best-effort workaround |
-| APK signing may produce invalid signature | Medium | v1 signing without full PKCS7 wrapping may be rejected by some Android versions |
+| AAPT2/AAPT not available on stock Android | High | No plain-zip fallback anymore (removed). Build now fails clearly if valid resource packaging isn't possible |
+| APK signing device variance | Medium | PKCS#7 signing is implemented, but OEM parse behavior can still vary |
 | Generated app only supports Java | Medium | No Kotlin boilerplate, no Compose |
 | Large dependency trees | Low | Mobile data + time constraints; may timeout |
 | No Gradle support | Low | Custom pipeline only, not full Gradle compatibility |
@@ -366,42 +416,33 @@ android:name=".ForgeApplication"          <!-- App class -->
 
 ## Recommended Next Tasks (Priority Order)
 
-### 1. 🔴 Fix DEX step — Most critical blocker
-The `dx` tool is not reliably available. Options:
-- Bundle D8 (Google's modern DEX compiler) as a pre-dexed JAR inside Forge's assets
-- Or download it at runtime like ECJ
-- D8 JAR URL: `https://maven.google.com/com/android/tools/r8/8.3.37/r8-8.3.37.jar`
-- Call via reflection: `com.android.tools.r8.D8.main(args)`
+### 1. 🔴 Bundle `aapt2` for stock Android
+Current resource packaging is the largest remaining blocker on devices without Termux tooling.
+- Add architecture-specific `aapt2` binaries to `jniLibs/` or assets
+- Extract/chmod at runtime
+- Use bundled binary before shell/toolchain fallbacks
 
-### 2. 🔴 Fix resource packaging — Second critical blocker
-AAPT2 is not available on stock Android. Options:
-- Bundle a pre-compiled `aapt2` binary for arm64-v8a as a native lib in `jniLibs/`
-- Extract at runtime to app's files dir, chmod +x, execute
-- Source: Android SDK build-tools (can extract `aapt2` binary)
+### 2. 🔴 Add Kotlin project compilation support
+- Download/bundle `kotlin-compiler-embeddable`
+- Compile `.kt` + `.java` together before D8 step
+- Update boilerplate + agent prompts to generate Kotlin when requested
 
-### 3. 🟡 Fix APK v1 signing
-Current PKCS7 output is simplified. Need proper DER-encoded PKCS7 SignedData:
-- Use `org.bouncycastle:bcpkix-jdk15on` (add to deps) for proper PKCS7
-- Or use Android's `sun.security.pkcs.PKCS9Attribute` via reflection
+### 3. 🟡 Improve dependency resolution robustness
+- Add retry/backoff + mirror fallback for Maven artifacts
+- Surface per-artifact failure in UI
+- Optional: cache index/metadata for offline re-builds
 
-### 4. 🟡 Add Kotlin compilation support
-- Download `kotlin-compiler-embeddable` JAR at runtime
-- Load via DexClassLoader same way as ECJ
-- Add `.kt` file detection in BuildEngine
+### 4. 🟡 Improve install status UX
+- Show explicit install states (`Waiting for confirmation`, `Installing`, `Installed`, `Failed`)
+- Display `PackageInstaller` status code + message in build log sheet
 
-### 5. 🟢 Improve agent prompt quality
-- The system prompt in ForgeAgent.kt can be tuned for better code quality
-- Add examples of good vs bad responses to the prompt
-- Consider adding a "review" step before applying operations
+### 5. 🟢 Stream Claude output in chat
+- Move agent responses to streaming mode (SSE)
+- Show partial model output while tools/files are being prepared
 
-### 6. 🟢 Add streaming Claude responses
-- Currently waits for full response before showing anything
-- Use SSE streaming from Anthropic API for live token display
-- Show "Claude is typing..." with partial response
-
-### 7. 🟢 Template library
-- Pre-built starter projects (calculator, to-do, weather, etc.)
-- Show in NewProjectDialog as an option
+### 6. 🟢 Template library
+- Add starter templates in `NewProjectDialog` (calculator, todo, notes, etc.)
+- Include offline-safe templates as defaults
 
 ---
 
@@ -476,10 +517,10 @@ Start your new session with:
 > "I'm continuing development of Forge, an on-device Android IDE app powered by Claude Opus. Here is the full project context: [paste this file]. I need help with: [your task]"
 
 Good starting tasks:
-- "Fix the DEX compilation step by bundling D8"
-- "Fix the APK resource packaging step by bundling aapt2 as a native library"
-- "Add Kotlin compilation support"
-- "Fix the APK v1 signing to produce valid PKCS7"
+- "Bundle aapt2 as a native library for stock Android resource packaging"
+- "Add Kotlin source compilation support in BuildEngine"
+- "Improve dependency resolver retries and mirror fallback"
+- "Add richer install status states in chat UI"
 - "There's a new compiler error: [paste error]"
 
 ---

@@ -139,6 +139,9 @@ dependencies {
     // R8/D8 — for on-device .class → .dex conversion (replaces system dx which doesn't exist on stock Android)
     implementation("com.android.tools:r8:8.3.37")
 
+    // APK signing library — generates platform-valid APK signatures (v1/v2/v3)
+    implementation("com.android.tools.build:apksig:8.3.2")
+
     // BouncyCastle — for proper PKCS#7 APK v1 signing (raw signature bytes are rejected by modern Android)
     implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 

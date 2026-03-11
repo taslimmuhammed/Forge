@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Typeface
 import android.os.Bundle
+import android.content.pm.PackageInstaller
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
@@ -49,11 +50,20 @@ class ChatActivity : AppCompatActivity() {
         override fun onReceive(context: Context, intent: Intent) {
             val success = intent.getBooleanExtra(PackageInstallReceiver.EXTRA_SUCCESS, false)
             val pkg = intent.getStringExtra(PackageInstallReceiver.EXTRA_PACKAGE_NAME)
+            val status = intent.getIntExtra(PackageInstallReceiver.EXTRA_STATUS, -1)
+            val statusMessage = intent.getStringExtra(PackageInstallReceiver.EXTRA_STATUS_MESSAGE)
+
+            if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                viewModel.addSystemMessagePublic("Install confirmation required. Approve the prompt to continue.")
+                Toast.makeText(context, "Please confirm app install", Toast.LENGTH_SHORT).show()
+                return
+            }
+
             if (success) {
                 viewModel.onInstallSuccess(pkg ?: "")
                 Toast.makeText(context, "App installed! Launching...", Toast.LENGTH_SHORT).show()
             } else {
-                viewModel.onInstallFailed()
+                viewModel.onInstallFailed(statusMessage)
                 Toast.makeText(context, "Installation failed", Toast.LENGTH_SHORT).show()
             }
         }
