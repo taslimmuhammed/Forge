@@ -37,6 +37,8 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    suspend fun getProject(id: String): ForgeProject? = repository.getProject(id)
+
     class Factory(private val application: Application) : ViewModelProvider.Factory {
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             @Suppress("UNCHECKED_CAST")

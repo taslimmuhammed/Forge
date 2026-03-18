@@ -15,6 +15,7 @@ import android.view.View
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
@@ -26,8 +27,11 @@ import com.forge.app.data.models.AgentResponse
 import com.forge.app.data.models.BuildStatus
 import com.forge.app.databinding.ActivityChatBinding
 import com.forge.app.utils.PermissionHelper
+import com.forge.app.utils.ProjectExportManager
 import com.forge.app.utils.SecureStorage
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class ChatActivity : AppCompatActivity() {
@@ -45,6 +49,34 @@ class ChatActivity : AppCompatActivity() {
         )
     }
     private lateinit var messageAdapter: MessageAdapter
+    private val exportCodeLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip")
+    ) { uri ->
+        val project = viewModel.project.value
+        if (uri == null || project == null) return@registerForActivityResult
+
+        lifecycleScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    ProjectExportManager(this@ChatActivity).exportProjectSource(project, uri)
+                }
+            }
+
+            result.onSuccess {
+                Toast.makeText(
+                    this@ChatActivity,
+                    "Code exported to your phone storage",
+                    Toast.LENGTH_LONG
+                ).show()
+            }.onFailure { error ->
+                Toast.makeText(
+                    this@ChatActivity,
+                    "Export failed: ${error.message}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
 
     private val installReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -187,6 +219,7 @@ class ChatActivity : AppCompatActivity() {
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
         return when (item.itemId) {
             android.R.id.home -> { onBackPressed(); true }
+            R.id.action_export_code -> { exportCode(); true }
             R.id.action_export_apk -> { exportApk(); true }
             R.id.action_clear_chat -> { confirmClearChat(); true }
             R.id.action_settings -> {
@@ -194,6 +227,11 @@ class ChatActivity : AppCompatActivity() {
             }
             else -> super.onOptionsItemSelected(item)
         }
+    }
+
+    private fun exportCode() {
+        val project = viewModel.project.value ?: return
+        exportCodeLauncher.launch(ProjectExportManager.suggestedArchiveName(project))
     }
 
     private fun exportApk() {

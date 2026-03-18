@@ -7,8 +7,10 @@ import android.view.MenuItem
 import android.view.View
 import android.widget.EditText
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
 import com.forge.app.data.models.ForgeProject
@@ -18,22 +20,75 @@ import com.forge.app.ui.chat.ChatActivity
 import com.forge.app.ui.home.HomeViewModel
 import com.forge.app.ui.home.NewProjectDialog
 import com.forge.app.ui.home.ProjectAdapter
+import com.forge.app.utils.ProjectExportManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
+
+    companion object {
+        private const val STATE_PENDING_EXPORT_PROJECT_ID = "pending_export_project_id"
+    }
 
     private lateinit var binding: ActivityMainBinding
     private val viewModel: HomeViewModel by viewModels { HomeViewModel.Factory(application) }
     private lateinit var adapter: ProjectAdapter
+    private var pendingCodeExportProjectId: String? = null
+    private val exportCodeLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip")
+    ) { uri ->
+        val projectId = pendingCodeExportProjectId
+        pendingCodeExportProjectId = null
+
+        if (uri == null || projectId == null) return@registerForActivityResult
+
+        lifecycleScope.launch {
+            val project = viewModel.getProject(projectId)
+            if (project == null) {
+                Toast.makeText(this@MainActivity, "Project not found", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+
+            binding.progressBar.visibility = View.VISIBLE
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    ProjectExportManager(this@MainActivity).exportProjectSource(project, uri)
+                }
+            }
+            binding.progressBar.visibility = View.GONE
+
+            result.onSuccess {
+                Toast.makeText(
+                    this@MainActivity,
+                    "Code exported to your phone storage",
+                    Toast.LENGTH_LONG
+                ).show()
+            }.onFailure { error ->
+                Toast.makeText(
+                    this@MainActivity,
+                    "Export failed: ${error.message}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        pendingCodeExportProjectId = savedInstanceState?.getString(STATE_PENDING_EXPORT_PROJECT_ID)
         setSupportActionBar(binding.toolbar)
         setupRecyclerView()
         setupFab()
         observeProjects()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(STATE_PENDING_EXPORT_PROJECT_ID, pendingCodeExportProjectId)
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -100,14 +155,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showProjectOptions(project: ForgeProject) {
-        val options = arrayOf("Rename", "Export APK", "Delete")
+        val options = arrayOf("Rename", "Export Code", "Export APK", "Delete")
         androidx.appcompat.app.AlertDialog.Builder(this)
             .setTitle(project.name)
             .setItems(options) { _, which ->
                 when (which) {
                     0 -> showRenameDialog(project)
-                    1 -> openProjectForExport(project)
-                    2 -> confirmDeleteProject(project)
+                    1 -> exportProjectCode(project)
+                    2 -> exportProjectApk(project)
+                    3 -> confirmDeleteProject(project)
                 }
             }.show()
     }
@@ -132,10 +188,26 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("Cancel", null).show()
     }
 
-    private fun openProjectForExport(project: ForgeProject) {
-        // Open chat screen where user can tap Export APK from the menu
-        openProject(project)
-        Toast.makeText(this, "Tap the menu (⋮) > Export APK in the project screen", Toast.LENGTH_LONG).show()
+    private fun exportProjectCode(project: ForgeProject) {
+        pendingCodeExportProjectId = project.id
+        exportCodeLauncher.launch(ProjectExportManager.suggestedArchiveName(project))
+    }
+
+    private fun exportProjectApk(project: ForgeProject) {
+        val apkFile = File(filesDir, "projects/${project.id}/build/output/app-debug.apk")
+        if (!apkFile.exists()) {
+            Toast.makeText(this, "Build the app first in the project screen", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apkFile)
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "application/vnd.android.package-archive"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, "${project.name}.apk")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(shareIntent, "Export APK"))
     }
 
     private fun confirmDeleteProject(project: ForgeProject) {

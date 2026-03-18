@@ -309,8 +309,8 @@ class BuildEngine(
         val buildDir = File(root, "build")
         val classesDir = File(buildDir, "classes").also { it.deleteRecursively(); it.mkdirs() }
         val dexDir = File(buildDir, "dex").also { it.deleteRecursively(); it.mkdirs() }
-        val outputDir = File(buildDir, "output").also { it.mkdirs() }
-        val resDir = File(buildDir, "res").also { it.mkdirs() }
+        val outputDir = File(buildDir, "output").also { it.deleteRecursively(); it.mkdirs() }
+        val resDir = File(buildDir, "res").also { it.deleteRecursively(); it.mkdirs() }
         return BuildEnvironment(
             projectRoot = root,
             srcDir = fileManager.srcMainDir,
@@ -1235,6 +1235,10 @@ class BuildEngine(
             val targetSdk = maxOf(existingTarget ?: GENERATED_TARGET_SDK, GENERATED_TARGET_SDK)
             usesSdk.setAttributeNS(ANDROID_NS, "android:minSdkVersion", minSdk.toString())
             usesSdk.setAttributeNS(ANDROID_NS, "android:targetSdkVersion", targetSdk.toString())
+
+            val versionCode = VersionManager(fileManager).getCurrentVersionCode()
+            manifest.setAttributeNS(ANDROID_NS, "android:versionCode", versionCode.toString())
+            manifest.setAttributeNS(ANDROID_NS, "android:versionName", "1.0.$versionCode")
 
             val transformer = TransformerFactory.newInstance().newTransformer().apply {
                 setOutputProperty(OutputKeys.INDENT, "yes")
