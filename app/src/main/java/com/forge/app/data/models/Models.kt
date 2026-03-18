@@ -62,7 +62,8 @@ data class AgentResponse(
     val needsConfirmation: Boolean = false,
     val confirmationMessage: String? = null,
     val newDependencies: List<String> = emptyList(),
-    val userMessage: String = ""
+    val userMessage: String = "",
+    val warningMessage: String? = null
 )
 
 data class BuildResult(

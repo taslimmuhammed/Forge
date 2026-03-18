@@ -97,12 +97,13 @@ class ChatViewModel(
                     is AgentStreamEvent.Complete -> {
                         lastBuildError = null
                         addAssistantMessage(event.response.userMessage, event.response.operations)
+                        event.response.warningMessage?.takeIf { it.isNotBlank() }?.let(::addSystemMessage)
                         if (event.response.newDependencies.isNotEmpty()) {
                             addSystemMessage("Adding dependencies: ${event.response.newDependencies.joinToString()}")
                         }
                         _uiState.value = ChatUiState.Idle
                         if (event.response.operations.isNotEmpty()) {
-                            addSystemMessage("Files updated. Tap Run to build and test your changes.")
+                            addSystemMessage(buildOperationSummary(event.response.operations))
                         }
                     }
                     is AgentStreamEvent.Error -> {
@@ -223,8 +224,12 @@ class ChatViewModel(
                 when (event) {
                     is AgentStreamEvent.Complete -> {
                         addAssistantMessage(event.response.userMessage, event.response.operations)
+                        event.response.warningMessage?.takeIf { it.isNotBlank() }?.let(::addSystemMessage)
                         lastBuildError = null
                         _uiState.value = ChatUiState.Idle
+                        if (event.response.operations.isNotEmpty()) {
+                            addSystemMessage(buildOperationSummary(event.response.operations))
+                        }
                         addSystemMessage("Fix applied. Tap Run to rebuild.")
                     }
                     is AgentStreamEvent.Error -> {
@@ -244,7 +249,11 @@ class ChatViewModel(
                 when (event) {
                     is AgentStreamEvent.Complete -> {
                         addAssistantMessage(event.response.userMessage, event.response.operations)
+                        event.response.warningMessage?.takeIf { it.isNotBlank() }?.let(::addSystemMessage)
                         _uiState.value = ChatUiState.Idle
+                        if (event.response.operations.isNotEmpty()) {
+                            addSystemMessage(buildOperationSummary(event.response.operations))
+                        }
                     }
                     else -> {}
                 }
@@ -323,6 +332,48 @@ class ChatViewModel(
     private fun addMessage(message: ChatMessage) {
         _messages.value = _messages.value + message
         chatHistoryManager?.appendMessage(message)
+    }
+
+    private fun buildOperationSummary(operations: List<AgentOperation>): String {
+        val writePaths = operations
+            .filter { it.type == OperationType.WRITE }
+            .map { it.path.substringAfterLast("/") }
+
+        val deletePaths = operations
+            .filter { it.type == OperationType.DELETE }
+            .map { it.path.substringAfterLast("/") }
+
+        val renameCount = operations.count { it.type == OperationType.RENAME }
+        val mkdirCount = operations.count { it.type == OperationType.MKDIR }
+
+        return buildString {
+            if (writePaths.isNotEmpty()) {
+                appendLine("Updated files:")
+                writePaths.take(5).forEach { appendLine("- $it") }
+                val remaining = writePaths.size - 5
+                if (remaining > 0) appendLine("- ... and $remaining more")
+            }
+            if (deletePaths.isNotEmpty()) {
+                if (isNotEmpty()) appendLine()
+                appendLine("Deleted files:")
+                deletePaths.take(3).forEach { appendLine("- $it") }
+                val remaining = deletePaths.size - 3
+                if (remaining > 0) appendLine("- ... and $remaining more")
+            }
+            if (renameCount > 0 || mkdirCount > 0) {
+                if (isNotEmpty()) appendLine()
+                append("Other changes:")
+                if (renameCount > 0) append(" $renameCount rename")
+                if (renameCount > 1) append("s")
+                if (renameCount > 0 && mkdirCount > 0) append(",")
+                if (mkdirCount > 0) append(" $mkdirCount folder")
+                if (mkdirCount > 1) append("s")
+            }
+            if (isNotEmpty()) {
+                appendLine()
+                append("Tap Run to build and test the updated app.")
+            }
+        }.trim()
     }
 
     private fun logLongError(message: String) {

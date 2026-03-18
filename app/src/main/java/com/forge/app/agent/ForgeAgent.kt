@@ -1,12 +1,11 @@
 package com.forge.app.agent
 
 import android.content.Context
+import android.util.Base64
 import android.util.Log
 import com.forge.app.data.models.*
 import com.forge.app.data.repository.ProjectFileManager
 import com.forge.app.utils.SecureStorage
-import com.google.gson.Gson
-import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -16,6 +15,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -39,12 +39,11 @@ class ForgeAgent(
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    private val gson = Gson()
-
     // Conversation history (in-memory, bounded)
     private val conversationHistory = mutableListOf<ConversationTurn>()
 
     data class ConversationTurn(val role: String, val content: String)
+    data class AnthropicResult(val text: String, val toolUse: JSONObject? = null)
 
     // ─────────────────────────────────────────────────────────────────
     // SYSTEM PROMPT
@@ -59,44 +58,20 @@ You autonomously modify Android projects based on natural language instructions.
 - Create new Activities, Fragments, Services
 - Implement any Android feature: networking, databases, UI, animations, etc.
 
-## STRICT OUTPUT FORMAT
-You MUST respond with ONLY a JSON object. No markdown, no explanation outside JSON.
+## HOW TO RESPOND
+You have access to a tool named `apply_project_changes`. 
+If the user asks you to modify the project, you MUST CALL `apply_project_changes` with the requested operations.
+If the user is only asking a question or no changes are needed, you can just reply with a normal text message.
 
-{
-  "thinking": "Your internal reasoning (1-2 sentences)",
-  "userMessage": "What you tell the user (friendly, brief, no code shown)",
-  "operations": [
-    {"type": "write", "path": "relative/path/from/project/root/file.java", "content": "full file content"},
-    {"type": "delete", "path": "relative/path/to/delete"},
-    {"type": "mkdir", "path": "relative/path/to/create"}
-  ],
-  "forgeMdUpdate": "Complete updated forge.md content (always update this)",
-  "needsConfirmation": false,
-  "confirmationMessage": null,
-  "newDependencies": ["groupId:artifactId:version"]
-}
-
-## RULES
-1. ALWAYS read and update forge.md - it is your memory
-2. Make MINIMAL changes to achieve the goal — don't rewrite what isn't broken
-3. Always provide complete file content in "write" operations (not diffs)
-4. Keep package names consistent with ${project.packageName}
-5. When adding dependencies, add to app/build.gradle AND list in forgeMdUpdate
-6. If a change could break something, set needsConfirmation=true  
-7. Never show raw code to users in userMessage — describe what you did instead
-8. Prefer Java over Kotlin for generated code (better ECJ compatibility)
-9. All layouts should use ConstraintLayout or LinearLayout for simplicity
-10. When fixing build errors, focus ONLY on the error — don't refactor other code
-
-## ANDROID CODING STANDARDS
-- Target API 26+ features when possible
-- Always declare Activities in AndroidManifest.xml
-- Use R.layout.xxx for setContentView, not hardcoded IDs
-- Prefer AppCompat variants (AppCompatActivity, etc.)
-- For networking: use OkHttp or HttpURLConnection (no Retrofit unless requested)
-- For database: use SQLiteOpenHelper or Room (if user requests)
-- String literals go in res/values/strings.xml
-- Colors go in res/values/colors.xml
+## RULES FOR PROJECT CHANGES
+1. ALWAYS read and update the forgeMdUpdate field.
+2. Make MINIMAL changes to achieve the goal.
+3. For EVERY "write" operation, use "contentBase64" with UTF-8 file bytes encoded as base64.
+4. Paths must be clean relative paths.
+5. This pipeline supports Java + XML projects ONLY. Do NOT generate Kotlin, Compose, or Gradle Kotlin DSL code!
+6. Keep package names consistent with ${project.packageName}
+7. Default to android.app.Activity, not AppCompatActivity.
+8. Use ConstraintLayout or LinearLayout for layouts.
     """.trimIndent()
 
     // ─────────────────────────────────────────────────────────────────
@@ -108,61 +83,89 @@ You MUST respond with ONLY a JSON object. No markdown, no explanation outside JS
     ): Flow<AgentStreamEvent> = flow {
         emit(AgentStreamEvent.Thinking("Reading project state..."))
 
-        // 1. Build context
-        val context = buildContext(userMessage, buildError)
+        val requestContext = buildContext(userMessage, buildError)
 
-        // 2. Check if summarization needed
         if (conversationHistory.size >= SUMMARY_THRESHOLD) {
             emit(AgentStreamEvent.Thinking("Summarizing context to optimize tokens..."))
             summarizeAndCompress()
         }
 
-        // 3. Add user message to history
-        conversationHistory.add(ConversationTurn("user", context))
+        emit(AgentStreamEvent.Thinking("Consulting Claude (Tool Use enabled)..."))
 
-        emit(AgentStreamEvent.Thinking("Consulting Claude Opus..."))
-
-        // 4. Call Claude API with retry logic
         var lastError: String? = null
         for (attempt in 1..MAX_RETRIES) {
             try {
-                val response = callClaudeAPI()
-                val parsed = parseAgentResponse(response)
+                val messagesArray = JSONArray()
+                val historyToSend = conversationHistory.takeLast(10)
+                historyToSend.forEach { turn ->
+                    messagesArray.put(JSONObject().apply {
+                        put("role", turn.role)
+                        put("content", turn.content)
+                    })
+                }
+                messagesArray.put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", requestContext)
+                })
 
-                // 5. Add assistant response to history
-                conversationHistory.add(ConversationTurn("assistant", response))
+                val anthropicResult = callAnthropic(buildSystemPrompt(), messagesArray)
+                
+                val parsed: AgentResponse = if (anthropicResult.toolUse != null) {
+                    val input = anthropicResult.toolUse
+                    input.put("userMessage", input.optString("userMessage", anthropicResult.text))
+                    parseStructuredAgentResponse(input.toString())
+                } else {
+                    AgentResponse(
+                        thinking = "",
+                        userMessage = anthropicResult.text.ifBlank { "I have reviewed your request but could not determine any file changes to make." },
+                        operations = emptyList(),
+                        forgeMdUpdate = null
+                    )
+                }
 
-                // 6. Handle confirmation if needed
+                conversationHistory.add(
+                    ConversationTurn("user", buildConversationUserTurn(userMessage, buildError))
+                )
+                conversationHistory.add(
+                    ConversationTurn("assistant", buildConversationAssistantTurn(parsed))
+                )
+
                 if (parsed.needsConfirmation && parsed.confirmationMessage != null) {
                     emit(AgentStreamEvent.NeedsConfirmation(parsed.confirmationMessage, parsed))
                     return@flow
                 }
 
-                // 7. Apply file operations
+                if (parsed.operations.isEmpty()) {
+                    emit(AgentStreamEvent.Complete(parsed))
+                    return@flow
+                }
+
                 emit(AgentStreamEvent.Thinking("Applying ${parsed.operations.size} file changes..."))
                 applyOperations(parsed)
 
-                // 8. Update forge.md
                 parsed.forgeMdUpdate?.let { fileManager.writeForgeMd(it) }
-
-                // 9. Update file hashes
                 fileManager.updateFileHashes()
 
-                // 10. Emit completion
                 emit(AgentStreamEvent.Complete(parsed))
                 return@flow
 
             } catch (e: Exception) {
                 lastError = e.message ?: "Unknown error"
                 Log.e(TAG, "API attempt $attempt failed: $lastError", e)
-                if (attempt < MAX_RETRIES) {
+                val retriable = e is IOException
+                if (retriable && attempt < MAX_RETRIES) {
                     emit(AgentStreamEvent.Thinking("Retrying... (attempt $attempt)"))
+                } else {
+                    emit(AgentStreamEvent.Error(lastError ?: "Unknown agent error"))
+                    return@flow
                 }
             }
         }
 
         emit(AgentStreamEvent.Error("Failed after $MAX_RETRIES attempts: $lastError"))
     }
+
+
 
     // ─────────────────────────────────────────────────────────────────
     // CONTEXT BUILDING (Token-Optimized)
@@ -254,26 +257,53 @@ You MUST respond with ONLY a JSON object. No markdown, no explanation outside JS
     // ─────────────────────────────────────────────────────────────────
     // CLAUDE API CALL
     // ─────────────────────────────────────────────────────────────────
-    private suspend fun callClaudeAPI(): String = withContext(Dispatchers.IO) {
+
+
+    private suspend fun callAnthropic(systemPrompt: String, messages: JSONArray): AnthropicResult = withContext(Dispatchers.IO) {
         val apiKey = SecureStorage.getApiKey(context)
             ?: throw IllegalStateException("API key not set")
-
-        val messages = JSONArray()
-
-        // Add history (bounded to last 10 turns to control tokens)
-        val historyToSend = conversationHistory.takeLast(10)
-        historyToSend.forEach { turn ->
-            messages.put(JSONObject().apply {
-                put("role", turn.role)
-                put("content", turn.content)
-            })
-        }
 
         val body = JSONObject().apply {
             put("model", MODEL)
             put("max_tokens", MAX_TOKENS)
-            put("system", buildSystemPrompt())
+            put("system", systemPrompt)
             put("messages", messages)
+            put("tools", JSONArray().apply {
+                put(JSONObject("""
+                    {
+                      "name": "apply_project_changes",
+                      "description": "Applies file modifications to the Android project and updates the forge.md memory file. Use this when you need to make code edits.",
+                      "input_schema": {
+                        "type": "object",
+                        "properties": {
+                          "thinking": { "type": "string" },
+                          "userMessage": { "type": "string", "description": "Friendly summary to the user." },
+                          "operations": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "type": { "type": "string", "enum": ["write", "delete", "mkdir", "rename"] },
+                                "path": { "type": "string" },
+                                "contentBase64": { "type": "string", "description": "Base64 encoded UTF-8 file bytes" },
+                                "content": { "type": "string", "description": "Target string for rename operation" }
+                              },
+                              "required": ["type", "path"]
+                            }
+                          },
+                          "forgeMdUpdate": { "type": "string", "description": "Full updated forge.md memory content" },
+                          "needsConfirmation": { "type": "boolean" },
+                          "confirmationMessage": { "type": "string" },
+                          "newDependencies": {
+                            "type": "array",
+                            "items": { "type": "string", "description": "group:artifact:version" }
+                          }
+                        },
+                        "required": ["operations", "userMessage"]
+                      }
+                    }
+                """.trimIndent()))
+            })
         }
 
         val request = Request.Builder()
@@ -293,58 +323,160 @@ You MUST respond with ONLY a JSON object. No markdown, no explanation outside JS
 
         val responseBody = response.body?.string() ?: throw IOException("Empty response")
         val json = JSONObject(responseBody)
-        json.getJSONArray("content").getJSONObject(0).getString("text")
+        
+        var textResult = ""
+        var toolUseObj: JSONObject? = null
+
+        val contentArr = json.optJSONArray("content") ?: JSONArray()
+        for (i in 0 until contentArr.length()) {
+            val block = contentArr.optJSONObject(i) ?: continue
+            val type = block.optString("type")
+            if (type == "text") {
+                textResult += block.optString("text")
+            } else if (type == "tool_use" && block.optString("name") == "apply_project_changes") {
+                toolUseObj = block.optJSONObject("input")
+            }
+        }
+        
+        if (textResult.isBlank() && toolUseObj == null) {
+            throw IOException("No valid text or tool_use in Anthropic response")
+        }
+        
+        AnthropicResult(textResult, toolUseObj)
     }
 
     // ─────────────────────────────────────────────────────────────────
     // RESPONSE PARSING
     // ─────────────────────────────────────────────────────────────────
-    private fun parseAgentResponse(rawResponse: String): AgentResponse {
-        // Strip markdown code fences if present
-        val cleaned = rawResponse
-            .removePrefix("```json")
-            .removePrefix("```")
-            .removeSuffix("```")
+    private fun parseStructuredAgentResponse(jsonText: String): AgentResponse {
+        val json = JSONObject(jsonText)
+        val warnings = mutableListOf<String>()
+        val operations = mutableListOf<AgentOperation>()
+
+        json.optJSONArray("operations")?.let { ops ->
+            for (i in 0 until ops.length()) {
+                val op = ops.optJSONObject(i)
+                if (op == null) {
+                    warnings += "Skipped operation ${i + 1} because it was not a JSON object."
+                    continue
+                }
+
+                val typeName = op.optString("type").trim().uppercase()
+                val type = runCatching { OperationType.valueOf(typeName) }.getOrElse {
+                    warnings += "Skipped operation ${i + 1} because type \"$typeName\" is unsupported."
+                    return@getOrElse null
+                } ?: continue
+
+                val rawPath = op.optNullableString("path")
+                if (rawPath.isNullOrBlank()) {
+                    warnings += "Skipped a ${type.name.lowercase()} operation because the path was missing."
+                    continue
+                }
+
+                val path = runCatching { normalizeOperationPath(rawPath) }.getOrElse { error ->
+                    warnings += "Skipped ${type.name.lowercase()} for \"$rawPath\": ${error.message}"
+                    null
+                } ?: continue
+
+                if (type == OperationType.WRITE && path.endsWith(".kt")) {
+                    warnings += "Skipped write for \"$path\" because generated projects currently support Java/XML edits only."
+                    continue
+                }
+
+                val content = when (type) {
+                    OperationType.WRITE -> decodeWriteContent(op, path, warnings)
+                    OperationType.RENAME -> {
+                        val target = op.optNullableString("content")
+                        if (target.isNullOrBlank()) {
+                            warnings += "Skipped rename for \"$path\" because the target path was missing."
+                            null
+                        } else {
+                            runCatching { normalizeOperationPath(target) }.getOrElse { error ->
+                                warnings += "Skipped rename for \"$path\": ${error.message}"
+                                null
+                            }
+                        }
+                    }
+                    else -> op.optNullableString("content")
+                }
+
+                if (type == OperationType.WRITE && content == null) {
+                    continue
+                }
+
+                operations += AgentOperation(
+                    type = type,
+                    path = path,
+                    content = content
+                )
+            }
+        }
+
+        val newDeps = mutableListOf<String>()
+        json.optJSONArray("newDependencies")?.let { deps ->
+            for (i in 0 until deps.length()) {
+                deps.optString(i).takeIf { it.isNotBlank() }?.let(newDeps::add)
+            }
+        }
+
+        return AgentResponse(
+            thinking = json.optString("thinking", ""),
+            userMessage = json.optString("userMessage", "Done!"),
+            operations = operations,
+            forgeMdUpdate = json.optNullableString("forgeMdUpdate"),
+            needsConfirmation = json.optBoolean("needsConfirmation", false),
+            confirmationMessage = json.optNullableString("confirmationMessage"),
+            newDependencies = newDeps,
+            warningMessage = warnings.distinct().take(3).joinToString("\n").ifBlank { null }
+        )
+    }
+
+    private fun decodeWriteContent(
+        op: JSONObject,
+        path: String,
+        warnings: MutableList<String>
+    ): String? {
+        op.optNullableString("contentBase64")?.takeIf { it.isNotBlank() }?.let { encoded ->
+            return try {
+                String(Base64.decode(encoded, Base64.DEFAULT), Charsets.UTF_8)
+            } catch (e: IllegalArgumentException) {
+                warnings += "Skipped write for \"$path\" because contentBase64 was invalid."
+                null
+            }
+        }
+
+        op.optNullableString("content")?.let { return it }
+        warnings += "Skipped write for \"$path\" because file content was missing."
+        return null
+    }
+
+
+
+    private fun normalizeOperationPath(path: String): String {
+        val normalized = path
+            .replace('\\', '/')
+            .replace(Regex("""\s*/\s*"""), "/")
+            .replace(Regex("/+"), "/")
+            .removePrefix("./")
             .trim()
+            .trim('/')
 
-        return try {
-            val json = JSONObject(cleaned)
-            val operations = mutableListOf<AgentOperation>()
+        require(normalized.isNotBlank()) { "path is blank" }
+        require(
+            normalized != ".." &&
+                !normalized.startsWith("../") &&
+                !normalized.contains("/../")
+        ) {
+            "path cannot escape the project root"
+        }
+        return normalized
+    }
 
-            json.optJSONArray("operations")?.let { ops ->
-                for (i in 0 until ops.length()) {
-                    val op = ops.getJSONObject(i)
-                    operations.add(
-                        AgentOperation(
-                            type = OperationType.valueOf(
-                                op.getString("type").uppercase()
-                            ),
-                            path = op.getString("path"),
-                            content = op.optString("content", null)
-                        )
-                    )
-                }
-            }
-
-            val newDeps = mutableListOf<String>()
-            json.optJSONArray("newDependencies")?.let { deps ->
-                for (i in 0 until deps.length()) {
-                    newDeps.add(deps.getString(i))
-                }
-            }
-
-            AgentResponse(
-                thinking = json.optString("thinking", ""),
-                userMessage = json.optString("userMessage", "Done!"),
-                operations = operations,
-                forgeMdUpdate = json.optString("forgeMdUpdate", null),
-                needsConfirmation = json.optBoolean("needsConfirmation", false),
-                confirmationMessage = json.optString("confirmationMessage", null),
-                newDependencies = newDeps
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse response: $rawResponse", e)
-            AgentResponse(userMessage = "Error parsing response: ${e.message}")
+    private fun JSONObject.optNullableString(name: String): String? {
+        val value = opt(name)
+        return when (value) {
+            null, JSONObject.NULL -> null
+            else -> value.toString()
         }
     }
 
@@ -353,31 +485,95 @@ You MUST respond with ONLY a JSON object. No markdown, no explanation outside JS
     // ─────────────────────────────────────────────────────────────────
     private fun applyOperations(response: AgentResponse) {
         response.operations.forEach { op ->
-            when (op.type) {
-                OperationType.WRITE -> {
-                    op.content?.let { content ->
-                        fileManager.writeFile(op.path, content)
-                        Log.d(TAG, "Written: ${op.path}")
+            try {
+                when (op.type) {
+                    OperationType.WRITE -> {
+                        op.content?.let { content ->
+                            fileManager.writeFile(op.path, content)
+                            Log.d(TAG, "Written: ${op.path}")
+                        }
+                    }
+                    OperationType.DELETE -> {
+                        fileManager.deleteFile(op.path)
+                        Log.d(TAG, "Deleted: ${op.path}")
+                    }
+                    OperationType.MKDIR -> {
+                        val dir = resolveOperationFile(op.path)
+                        dir.mkdirs()
+                        Log.d(TAG, "Created dir: ${op.path}")
+                    }
+                    OperationType.RENAME -> {
+                        val targetPath = op.content
+                            ?: throw IllegalArgumentException("rename target path missing")
+                        val src = resolveOperationFile(op.path)
+                        val dst = resolveOperationFile(targetPath)
+                        dst.parentFile?.mkdirs()
+
+                        if (!src.exists()) {
+                            throw IllegalArgumentException("source path does not exist")
+                        }
+
+                        val renamed = src.renameTo(dst)
+                        if (!renamed) {
+                            if (src.isDirectory) {
+                                src.copyRecursively(dst, overwrite = true)
+                                src.deleteRecursively()
+                            } else {
+                                src.copyTo(dst, overwrite = true)
+                                src.delete()
+                            }
+                        }
+                        Log.d(TAG, "Renamed: ${op.path} -> $targetPath")
                     }
                 }
-                OperationType.DELETE -> {
-                    fileManager.deleteFile(op.path)
-                    Log.d(TAG, "Deleted: ${op.path}")
-                }
-                OperationType.MKDIR -> {
-                    val dir = java.io.File(fileManager.getProjectRoot(), op.path)
-                    dir.mkdirs()
-                    Log.d(TAG, "Created dir: ${op.path}")
-                }
-                OperationType.RENAME -> {
-                    // Handle rename
-                    val src = java.io.File(fileManager.getProjectRoot(), op.path)
-                    val dst = java.io.File(fileManager.getProjectRoot(), op.content ?: "")
-                    src.renameTo(dst)
-                }
+            } catch (e: Exception) {
+                throw IllegalStateException(
+                    "Failed to apply ${op.type.name.lowercase()} operation for ${op.path}: ${e.message}",
+                    e
+                )
             }
         }
     }
+
+    private fun resolveOperationFile(relativePath: String): File {
+        val normalized = normalizeOperationPath(relativePath)
+        val root = fileManager.getProjectRoot().canonicalFile
+        val target = File(root, normalized).canonicalFile
+        require(
+            target.path == root.path || target.path.startsWith(root.path + File.separator)
+        ) {
+            "Resolved path escapes project root: $relativePath"
+        }
+        return target
+    }
+
+    private fun buildConversationUserTurn(userMessage: String, buildError: String?): String = buildString {
+        append(userMessage.trim())
+        if (!buildError.isNullOrBlank()) {
+            append("\nBuild error context:\n")
+            append(buildError.take(800))
+        }
+    }.trim()
+
+    private fun buildConversationAssistantTurn(response: AgentResponse): String = buildString {
+        appendLine(response.userMessage.ifBlank { "Applied project changes." })
+        if (response.operations.isNotEmpty()) {
+            appendLine("Operations:")
+            response.operations.take(8).forEach { operation ->
+                appendLine("- ${operation.type.name.lowercase()}: ${operation.path}")
+            }
+            val remaining = response.operations.size - 8
+            if (remaining > 0) {
+                appendLine("- ... and $remaining more")
+            }
+        }
+        if (response.newDependencies.isNotEmpty()) {
+            appendLine("Dependencies: ${response.newDependencies.joinToString()}")
+        }
+        response.warningMessage?.takeIf { it.isNotBlank() }?.let { warning ->
+            appendLine("Warning: $warning")
+        }
+    }.trim()
 
     // ─────────────────────────────────────────────────────────────────
     // CONTEXT SUMMARIZATION (Token Optimization)

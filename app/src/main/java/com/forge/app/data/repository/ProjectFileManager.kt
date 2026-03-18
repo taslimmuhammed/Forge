@@ -292,22 +292,24 @@ dependencies {
     }
 
     fun writeFile(relativePath: String, content: String) {
-        val file = File(projectRoot, relativePath)
+        val file = resolveProjectFile(relativePath)
         file.parentFile?.mkdirs()
         file.writeText(content)
     }
 
     fun readFile(relativePath: String): String? {
-        val file = File(projectRoot, relativePath)
+        val file = runCatching { resolveProjectFile(relativePath) }.getOrNull() ?: return null
         return if (file.exists()) file.readText() else null
     }
 
     fun deleteFile(relativePath: String): Boolean {
-        return File(projectRoot, relativePath).delete()
+        val file = runCatching { resolveProjectFile(relativePath) }.getOrNull() ?: return false
+        return file.delete()
     }
 
     fun fileExists(relativePath: String): Boolean {
-        return File(projectRoot, relativePath).exists()
+        val file = runCatching { resolveProjectFile(relativePath) }.getOrNull() ?: return false
+        return file.exists()
     }
 
     fun getAllSourceFiles(): Map<String, String> {
@@ -371,6 +373,38 @@ dependencies {
             }
         }
         return output.toString()
+    }
+
+    private fun resolveProjectFile(relativePath: String): File {
+        val normalized = normalizeRelativePath(relativePath)
+        val root = projectRoot.canonicalFile
+        val resolved = File(root, normalized).canonicalFile
+        require(
+            resolved.path == root.path || resolved.path.startsWith(root.path + File.separator)
+        ) {
+            "Path escapes project root: $relativePath"
+        }
+        return resolved
+    }
+
+    private fun normalizeRelativePath(relativePath: String): String {
+        val normalized = relativePath
+            .replace('\\', '/')
+            .replace(Regex("""\s*/\s*"""), "/")
+            .replace(Regex("/+"), "/")
+            .removePrefix("./")
+            .trim()
+            .trim('/')
+
+        require(normalized.isNotBlank()) { "Path is blank" }
+        require(
+            normalized != ".." &&
+                !normalized.startsWith("../") &&
+                !normalized.contains("/../")
+        ) {
+            "Parent-directory segments are not allowed: $relativePath"
+        }
+        return normalized
     }
 
     fun getProjectRoot(): File = projectRoot
